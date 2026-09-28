@@ -377,6 +377,7 @@ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod 
 		}
 	}
 
+	var netpolOkCb func()
 	// Register the pod with the namespace (nsInfo + namespace port group,
 	// used by multicast and egress firewall) on any network whose pod IPs
 	// are known, including DHCP-learned ones.
@@ -392,6 +393,13 @@ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod 
 			return err
 		}
 		ops = append(ops, addOps...)
+
+		var netpolOps []ovsdb.Operation
+		netpolOps, netpolOkCb, err = bsnc.addLocalPodToNetworkPoliciesOps(pod, portUUID, nadKey, nil)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, netpolOps...)
 	}
 
 	recordOps, txOkCallBack, _, err := bsnc.AddConfigDurationRecord("pod", pod.Namespace, pod.Name)
@@ -407,6 +415,9 @@ func (bsnc *BaseUserDefinedNetworkController) addLogicalPortToNetworkForNAD(pod 
 		return fmt.Errorf("error transacting operations %+v: %v", ops, err)
 	}
 	txOkCallBack()
+	if netpolOkCb != nil {
+		netpolOkCb()
+	}
 
 	if lsp != nil {
 		_ = bsnc.logicalPortCache.add(pod, switchName, nadKey, lsp.UUID, podAnnotation.MAC, podAnnotation.IPs)

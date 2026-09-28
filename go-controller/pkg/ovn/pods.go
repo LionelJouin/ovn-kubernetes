@@ -300,6 +300,12 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error) 
 	}
 	ops = append(ops, addOps...)
 
+	netpolOps, netpolOkCb, err := oc.addLocalPodToNetworkPoliciesOps(pod, lsp.UUID, nadKey, nil)
+	if err != nil {
+		return err
+	}
+	ops = append(ops, netpolOps...)
+
 	if config.Gateway.DisableSNATMultipleGWs {
 		// Add NAT rules to pods if disable SNAT is set. External gateway routes
 		// (and the associated per-pod SNAT removal) are programmed by the
@@ -324,6 +330,7 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error) 
 		return fmt.Errorf("error transacting operations %+v: %v", ops, err)
 	}
 	txOkCallBack()
+	netpolOkCb()
 	oc.podRecorder.AddLSP(pod.UID, oc.GetNetInfo())
 
 	// if somehow lspUUID is empty, there is a bug here with interpreting OVSDB results

@@ -256,6 +256,12 @@ func (bnc *BaseNetworkController) deletePodLogicalPort(pod *corev1.Pod, portInfo
 	}
 	allOps = append(allOps, ops...)
 
+	netpolOps, netpolOkCb, err := bnc.deleteLocalPodFromNetworkPoliciesOps(pod, logicalPort, portUUID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("unable to delete pod %s from network policies: %w", podDesc, err)
+	}
+	allOps = append(allOps, netpolOps...)
+
 	ops, err = bnc.delLSPOps(logicalPort, switchName, portUUID)
 	// Tolerate cases where logical switch of the logical port no longer exist in OVN.
 	if err != nil && !errors.Is(err, libovsdbclient.ErrNotFound) {
@@ -274,6 +280,7 @@ func (bnc *BaseNetworkController) deletePodLogicalPort(pod *corev1.Pod, portInfo
 		return nil, fmt.Errorf("cannot delete logical switch port %s, %v", logicalPort, err)
 	}
 	txOkCallBack()
+	netpolOkCb()
 
 	// do not remove SNATs/GW routes/IPAM for an IP address unless we have validated no other pod is using it
 	if !shouldRelease {

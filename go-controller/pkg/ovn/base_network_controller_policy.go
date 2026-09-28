@@ -950,6 +950,166 @@ func (bnc *BaseNetworkController) requestLocalPodPolicyRetriesForPod(pod *corev1
 	}
 }
 
+// addLocalPodToNetworkPoliciesOps builds operations to add a newly created pod port
+// to all matching network policies and default deny port groups in a single batch,
+// avoiding individual transactions per policy.
+func (bnc *BaseNetworkController) addLocalPodToNetworkPoliciesOps(pod *corev1.Pod, portUUID, nadKey string, ops []ovsdb.Operation) ([]ovsdb.Operation, func(), error) {
+	if bnc.networkPolicies == nil || pod == nil || !bnc.isPodScheduledOnLocalNode(pod) || portUUID == "" {
+		return ops, func() {}, nil
+	}
+	portName := bnc.GetLogicalPortName(pod, nadKey)
+
+	var matchingNPs []*networkPolicy
+	for _, npKey := range bnc.networkPolicies.GetKeys() {
+		np, ok := bnc.networkPolicies.Load(npKey)
+		if !ok || np == nil || np.namespace != pod.Namespace {
+			continue
+		}
+		np.RLock()
+		localPodSelector := np.localPodSelector
+		deleted := np.deleted
+		np.RUnlock()
+		if deleted || localPodSelector == nil || !localPodSelector.Matches(labels.Set(pod.Labels)) {
+			continue
+		}
+		if _, ok := np.localPods.Load(portName); ok {
+			continue
+		}
+		matchingNPs = append(matchingNPs, np)
+	}
+
+	if len(matchingNPs) == 0 {
+		return ops, func() {}, nil
+	}
+
+	var err error
+	for _, np := range matchingNPs {
+		if !PortGroupHasPorts(bnc.nbClient, np.portGroupName, []string{portUUID}) {
+			ops, err = libovsdbops.AddPortsToPortGroupOps(bnc.nbClient, ops, np.portGroupName, portUUID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("unable to get ops to add pod to policy port group %s: %w", np.portGroupName, err)
+			}
+		}
+	}
+
+	// Update default deny port groups
+	pgKey := pod.Namespace
+	bnc.sharedNetpolPortGroups.LockKey(pgKey)
+	sharedPGs, ok := bnc.sharedNetpolPortGroups.Load(pgKey)
+	var allIngressDeny, allEgressDeny []string
+	if ok && sharedPGs != nil {
+		portNamesToUUIDs := map[string]string{portName: portUUID}
+		for _, np := range matchingNPs {
+			ingressDenyPorts, egressDenyPorts := sharedPGs.addPortsForPolicy(np, portNamesToUUIDs)
+			allIngressDeny = append(allIngressDeny, ingressDenyPorts...)
+			allEgressDeny = append(allEgressDeny, egressDenyPorts...)
+		}
+		if len(allIngressDeny) != 0 {
+			ingressDenyPGName := bnc.defaultDenyPortGroupName(pod.Namespace, libovsdbutil.ACLIngress)
+			ops, err = libovsdbops.AddPortsToPortGroupOps(bnc.nbClient, ops, ingressDenyPGName, allIngressDeny...)
+			if err != nil {
+				for _, np := range matchingNPs {
+					sharedPGs.deletePortsForPolicy(np, portNamesToUUIDs)
+				}
+				bnc.sharedNetpolPortGroups.UnlockKey(pgKey)
+				return nil, nil, fmt.Errorf("unable to get add ports to %s port group ops: %w", ingressDenyPGName, err)
+			}
+		}
+		if len(allEgressDeny) != 0 {
+			egressDenyPGName := bnc.defaultDenyPortGroupName(pod.Namespace, libovsdbutil.ACLEgress)
+			ops, err = libovsdbops.AddPortsToPortGroupOps(bnc.nbClient, ops, egressDenyPGName, allEgressDeny...)
+			if err != nil {
+				for _, np := range matchingNPs {
+					sharedPGs.deletePortsForPolicy(np, portNamesToUUIDs)
+				}
+				bnc.sharedNetpolPortGroups.UnlockKey(pgKey)
+				return nil, nil, fmt.Errorf("unable to get add ports to %s port group ops: %w", egressDenyPGName, err)
+			}
+		}
+		bnc.sharedNetpolPortGroups.UnlockKey(pgKey)
+	}
+
+	onSuccess := func() {
+		for _, np := range matchingNPs {
+			np.localPods.Store(portName, portUUID)
+		}
+	}
+
+	return ops, onSuccess, nil
+}
+
+// deleteLocalPodFromNetworkPoliciesOps builds operations to remove a deleting pod port
+// from all matching network policies and default deny port groups in a single batch.
+func (bnc *BaseNetworkController) deleteLocalPodFromNetworkPoliciesOps(pod *corev1.Pod, portName, portUUID string, ops []ovsdb.Operation) ([]ovsdb.Operation, func(), error) {
+	if bnc.networkPolicies == nil || pod == nil || portName == "" {
+		return ops, func() {}, nil
+	}
+
+	var matchingNPs []*networkPolicy
+	for _, npKey := range bnc.networkPolicies.GetKeys() {
+		np, ok := bnc.networkPolicies.Load(npKey)
+		if !ok || np == nil || np.namespace != pod.Namespace {
+			continue
+		}
+		if _, ok := np.localPods.Load(portName); ok {
+			matchingNPs = append(matchingNPs, np)
+		}
+	}
+
+	if len(matchingNPs) == 0 {
+		return ops, func() {}, nil
+	}
+
+	var err error
+	for _, np := range matchingNPs {
+		if portUUID != "" {
+			ops, err = libovsdbops.DeletePortsFromPortGroupOps(bnc.nbClient, ops, np.portGroupName, portUUID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("unable to get del ports from policy port group %s: %w", np.portGroupName, err)
+			}
+		}
+	}
+
+	// Update default deny port groups
+	pgKey := pod.Namespace
+	bnc.sharedNetpolPortGroups.LockKey(pgKey)
+	sharedPGs, ok := bnc.sharedNetpolPortGroups.Load(pgKey)
+	if ok && sharedPGs != nil {
+		portNamesToUUIDs := map[string]string{portName: portUUID}
+		var allIngressDeny, allEgressDeny []string
+		for _, np := range matchingNPs {
+			ingressDenyPorts, egressDenyPorts := sharedPGs.deletePortsForPolicy(np, portNamesToUUIDs)
+			allIngressDeny = append(allIngressDeny, ingressDenyPorts...)
+			allEgressDeny = append(allEgressDeny, egressDenyPorts...)
+		}
+		if len(allIngressDeny) != 0 && portUUID != "" {
+			ingressDenyPGName := bnc.defaultDenyPortGroupName(pod.Namespace, libovsdbutil.ACLIngress)
+			ops, err = libovsdbops.DeletePortsFromPortGroupOps(bnc.nbClient, ops, ingressDenyPGName, allIngressDeny...)
+			if err != nil {
+				bnc.sharedNetpolPortGroups.UnlockKey(pgKey)
+				return nil, nil, fmt.Errorf("unable to get del ports from %s port group ops: %w", ingressDenyPGName, err)
+			}
+		}
+		if len(allEgressDeny) != 0 && portUUID != "" {
+			egressDenyPGName := bnc.defaultDenyPortGroupName(pod.Namespace, libovsdbutil.ACLEgress)
+			ops, err = libovsdbops.DeletePortsFromPortGroupOps(bnc.nbClient, ops, egressDenyPGName, allEgressDeny...)
+			if err != nil {
+				bnc.sharedNetpolPortGroups.UnlockKey(pgKey)
+				return nil, nil, fmt.Errorf("unable to get del ports from %s port group ops: %w", egressDenyPGName, err)
+			}
+		}
+		bnc.sharedNetpolPortGroups.UnlockKey(pgKey)
+	}
+
+	onSuccess := func() {
+		for _, np := range matchingNPs {
+			np.localPods.Delete(portName)
+		}
+	}
+
+	return ops, onSuccess, nil
+}
+
 func (bnc *BaseNetworkController) getNetworkPolicyPortGroupDbIDs(namespace, name string) *libovsdbops.DbObjectIDs {
 	return libovsdbops.NewDbObjectIDs(libovsdbops.PortGroupNetworkPolicy, bnc.controllerName,
 		map[libovsdbops.ExternalIDKey]string{
