@@ -1977,6 +1977,55 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 			gomega.Expect(retry.GetBackoffFromRetryObj(key, nonMatchingRetry)).To(gomega.Equal(time.Second))
 		})
 
+		ginkgo.It("requests immediate local pod retries via DefaultNetworkController onLogicalPortCacheAdd", func() {
+			startOvn(initialDB, nil, nil, nil, nil)
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "selected-pod",
+					Namespace: namespaceName1,
+					Labels: map[string]string{
+						"app": "selected",
+					},
+				},
+			}
+			key, err := retry.GetResourceKey(pod)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			matchingSelector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "selected"},
+			})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			matchingRetry := retry.NewRetryFramework(
+				"test/netpol",
+				make(chan struct{}),
+				&sync.WaitGroup{},
+				nil,
+				&retry.ResourceHandler{
+					ObjType: factory.LocalPodSelectorType,
+					EventHandler: &networkControllerPolicyEventHandler{
+						objType: factory.LocalPodSelectorType,
+					},
+				},
+			)
+			retry.InitRetryObjWithAdd(pod, key, matchingRetry)
+
+			fakeOvn.controller.networkPolicies.Store("match", &networkPolicy{
+				name:             "match",
+				namespace:        namespaceName1,
+				localPodSelector: matchingSelector,
+				localPodRetry:    matchingRetry,
+			})
+
+			gomega.Expect(retry.GetBackoffFromRetryObj(key, matchingRetry)).To(gomega.Equal(time.Second))
+			gomega.Expect(fakeOvn.controller.onLogicalPortCacheAdd).NotTo(gomega.BeNil())
+
+			fakeOvn.controller.onLogicalPortCacheAdd(pod, types.DefaultNetworkName)
+
+			gomega.Expect(retry.GetBackoffFromRetryObj(key, matchingRetry)).To(gomega.BeZero())
+		})
+
 		ginkgo.It("correctly creates networkpolicy targeting hostNetwork pods with non-nil podSelector", func() {
 			// check useNamespaceAddrSet function comments to explain this behaviour
 			app.Action = func(*cli.Context) error {
