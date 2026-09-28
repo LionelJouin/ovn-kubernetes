@@ -308,6 +308,27 @@ func (r *RetryFramework) RequestRetryObjWithNoBackoff(obj interface{}) (bool, er
 	return requested, nil
 }
 
+// RequestRetryObjsWithFilter requests immediate retry with no backoff for any
+// object in the retry cache that matches the given filter.
+func (r *RetryFramework) RequestRetryObjsWithFilter(filter func(obj interface{}) bool) {
+	requested := false
+	for _, key := range r.retryEntries.GetKeys() {
+		r.DoWithLock(key, func(key string) {
+			entry, loaded := r.getRetryObj(key)
+			if !loaded || entry == nil || entry.newObj == nil {
+				return
+			}
+			if filter(entry.newObj) {
+				r.setRetryObjWithNoBackoff(entry)
+				requested = true
+			}
+		})
+	}
+	if requested {
+		r.RequestRetryObjs()
+	}
+}
+
 // Given an object and its type, it returns the key for this object and an error if the key retrieval failed.
 // For all namespaced resources, the key will be namespace/name. For resource types without a namespace,
 // the key will be the object name itself. obj must be a pointer to an API type.

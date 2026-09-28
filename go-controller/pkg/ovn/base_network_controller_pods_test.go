@@ -5,6 +5,7 @@ package ovn
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 
 	ovncnitypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
+	lsm "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/logical_switch_manager"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	ovntest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	ovntypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
@@ -366,4 +369,81 @@ func TestBaseNetworkController_allocatesPodAnnotation(t *testing.T) {
 			g.Expect(bnc.allocatesPodAnnotation()).To(gomega.Equal(tt.expected))
 		})
 	}
+}
+
+func TestBaseNetworkController_releasePodIPs(t *testing.T) {
+	g := gomega.NewWithT(t)
+	bnc := &BaseNetworkController{
+		ReconcilableNetInfo: &util.DefaultNetInfo{},
+		lsManager:           lsm.NewLogicalSwitchManager(),
+	}
+	// Init subnet on node1
+	_, cidr, _ := net.ParseCIDR("10.244.1.0/24")
+	err := bnc.lsManager.AddOrUpdateSwitch("node1", []*net.IPNet{cidr}, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	podIP, podIPNet, _ := net.ParseCIDR("10.244.1.5/24")
+	podIPNet.IP = podIP
+	err = bnc.lsManager.AllocateIPs("node1", []*net.IPNet{podIPNet})
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	// Set up retry framework for pods
+	stopChan := make(chan struct{})
+	defer close(stopChan)
+	retryPods := retry.NewRetryFramework(
+		"test-retry-pods",
+		stopChan,
+		&sync.WaitGroup{},
+		nil,
+		&retry.ResourceHandler{
+			ObjType: factory.PodType,
+			EventHandler: &networkControllerPolicyEventHandler{
+				objType: factory.PodType,
+			},
+		},
+	)
+	bnc.retryPods = retryPods
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-on-node1",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node1",
+		},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-on-node2",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node2",
+		},
+	}
+	key1, _ := retry.GetResourceKey(pod1)
+	key2, _ := retry.GetResourceKey(pod2)
+
+	retry.InitRetryObjWithAdd(pod1, key1, retryPods)
+	retry.InitRetryObjWithAdd(pod2, key2, retryPods)
+
+	g.Expect(retry.GetBackoffFromRetryObj(key1, retryPods)).To(gomega.Equal(time.Second))
+	g.Expect(retry.GetBackoffFromRetryObj(key2, retryPods)).To(gomega.Equal(time.Second))
+
+	// Release IP on node1
+	pInfo := &lpInfo{
+		name:          "port1",
+		logicalSwitch: "node1",
+		ips:           []*net.IPNet{podIPNet},
+	}
+	err = bnc.releasePodIPs(pInfo)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	// Pod1 on node1 should have backoff cleared to 0 (noBackoff)
+	g.Eventually(func() time.Duration {
+		return retry.GetBackoffFromRetryObj(key1, retryPods)
+	}).Should(gomega.BeZero())
+	// Pod2 on node2 should remain backed off
+	g.Expect(retry.GetBackoffFromRetryObj(key2, retryPods)).To(gomega.Equal(time.Second))
 }

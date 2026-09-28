@@ -359,6 +359,18 @@ func (bnc *BaseNetworkController) releasePodIPs(pInfo *lpInfo) error {
 			return fmt.Errorf("cannot release IPs of port %s on switch %s: %w", pInfo.name, pInfo.logicalSwitch, err)
 		}
 		klog.Warningf("Ignoring release IPs failure of port %s on switch %s: %v", pInfo.name, pInfo.logicalSwitch, err)
+	} else if bnc.retryPods != nil {
+		go bnc.retryPods.RequestRetryObjsWithFilter(func(obj interface{}) bool {
+			pod, ok := obj.(*corev1.Pod)
+			if !ok || pod == nil {
+				return false
+			}
+			expectedSwitch, err := bnc.getExpectedSwitchName(pod)
+			if err != nil {
+				return false
+			}
+			return expectedSwitch == pInfo.logicalSwitch
+		})
 	}
 	return nil
 }
