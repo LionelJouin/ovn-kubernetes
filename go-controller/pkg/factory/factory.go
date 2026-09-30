@@ -205,7 +205,7 @@ const (
 	// default priorities for various handlers (also the highest priority)
 	defaultHandlerPriority int = 0
 	// lowest priority among various handlers (See GetHandlerPriority for more information)
-	minHandlerPriority int = 4
+	minHandlerPriority int = 0
 
 	// used to determine if an internal informer has handlers attached to it or not
 	hasNoHandler uint32 = 0
@@ -1370,28 +1370,21 @@ func getObjectMeta(objType reflect.Type, obj interface{}) (*metav1.ObjectMeta, e
 
 type AddHandlerFuncType func(namespace string, sel labels.Selector, funcs cache.ResourceEventHandler, processExisting func([]interface{}) error) (*Handler, error)
 
-// GetHandlerPriority returns the priority of each objType's handler
-// Priority of the handler is what determine which handler would get an event first
-// This is relevant only for handlers that are sharing the same resources:
-// Pods: shared by PodType (0), EgressIPPodType (1), LocalPodSelectorType (3)
-// Namespaces: shared by NamespaceType (0), EgressIPNamespaceType (1)
-// Nodes: shared by NodeType (0), EgressNodeType (1)
-// By default handlers get the defaultHandlerPriority which is 0 (highest priority). Higher the number, lower the priority to get an event.
-// Example: EgressIPPodType will always get the pod event after PodType
-// NOTE: If you are touching this function to add a new object type that uses shared objects, please make sure to update `minHandlerPriority` if needed
+// GetHandlerPriority returns the priority of each objType's handler.
+// All object types now get the same, default priority: EgressIPPodType and
+// LocalPodSelectorType no longer need to run after PodType because
+// onLogicalPortCacheAdd explicitly requests an immediate retry for them once
+// the logical port cache is populated (see requestLocalPodPolicyRetriesForPod
+// and EgressIPController.addEgressIPPodRetry), instead of relying on
+// dispatch ordering. EgressIPNamespaceType and EgressNodeType never read any
+// state cached by NamespaceType/NodeType handlers, so they never needed
+// ordering in the first place.
+// NOTE: If you are touching this function to add a new object type that
+// shares an underlying resource with another handler, make sure the two
+// handlers don't depend on each other's in-process side effects; if they do,
+// prefer an explicit retry request over reintroducing priority ordering here.
 func (wf *WatchFactory) GetHandlerPriority(objType reflect.Type) (priority int) {
-	switch objType {
-	case EgressIPPodType:
-		return 1
-	case LocalPodSelectorType:
-		return 3
-	case EgressIPNamespaceType:
-		return 1
-	case EgressNodeType:
-		return 1
-	default:
-		return defaultHandlerPriority
-	}
+	return defaultHandlerPriority
 }
 
 func (wf *WatchFactory) GetResourceHandlerFunc(objType reflect.Type) (AddHandlerFuncType, error) {
