@@ -1919,13 +1919,18 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 				time.Sleep(100 * time.Millisecond)
 				goroutinesNumInit := runtime.NumGoroutine()
 				fmt.Printf("goroutinesNumInit %v", goroutinesNumInit)
-				// network policy will create 1 watchFactory for local pods selector
+				// network policy will create 1 watchFactory handler for the local
+				// pod selector, which costs 3 goroutines: the retry framework's
+				// own, plus the two client-go spends per handler registration
+				// (processorListener's run and pop). The previous design shared
+				// pre-started event-queue goroutines between handlers, so only
+				// the retry goroutine was new.
 				_, err := fakeOvn.fakeClient.KubeClient.NetworkingV1().NetworkPolicies(networkPolicy.Namespace).
 					Create(context.TODO(), networkPolicy, metav1.CreateOptions{})
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 				gomega.Eventually(func() int {
 					return runtime.NumGoroutine()
-				}).Should(gomega.Equal(goroutinesNumInit + 1))
+				}).Should(gomega.Equal(goroutinesNumInit + 3))
 
 				// Delete network policy
 				err = fakeOvn.fakeClient.KubeClient.NetworkingV1().NetworkPolicies(networkPolicy.Namespace).

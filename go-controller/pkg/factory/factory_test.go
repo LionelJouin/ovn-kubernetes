@@ -853,9 +853,10 @@ var _ = Describe("Watch Factory Operations", func() {
 		})
 
 		It("doesn't deadlock when factory is shutdown", func() {
-			// every queue has length 10, but some events may be handled before the stop channel event is selected,
-			// so multiply by 15 instead of 10 to ensure overflow
-			for i := uint32(1); i <= defaultNumEventQueues*15; i++ {
+			// Enough objects that the informer still has work in flight when
+			// the factory is shut down, so addHandler has to take the
+			// stopChan path rather than block.
+			for i := uint32(1); i <= 225; i++ {
 				pods = append(pods, newPod(fmt.Sprintf("pod%d", i), "default"))
 			}
 			wf, err = NewOVNKubeControllerWatchFactory(ovnClientset, "test-node")
@@ -1422,10 +1423,10 @@ var _ = Describe("Watch Factory Operations", func() {
 		err = wf.Start()
 		Expect(err).NotTo(HaveOccurred())
 
-		// Updates processed by the shared informer before addHandler flips
-		// hasHandlers are dropped, so they must only be sent once the handler
-		// receives its first initial add. They are then queued while the
-		// remaining initial adds are in flight and delivered after them.
+		// Updates processed by the shared informer before the handler is registered
+		// are dropped, so they must only be sent once the handler receives its first
+		// initial add. They are then queued while the remaining initial adds are in flight
+		// and delivered after them.
 		firstAdd := make(chan struct{})
 		firstAddOnce := sync.Once{}
 		doneWg := sync.WaitGroup{}
