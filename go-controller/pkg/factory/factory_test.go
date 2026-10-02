@@ -853,9 +853,10 @@ var _ = Describe("Watch Factory Operations", func() {
 		})
 
 		It("doesn't deadlock when factory is shutdown", func() {
-			// every queue has length 10, but some events may be handled before the stop channel event is selected,
-			// so multiply by 15 instead of 10 to ensure overflow
-			for i := uint32(1); i <= defaultNumEventQueues*15; i++ {
+			// Enough objects that the informer still has work in flight when
+			// the factory is shut down, so addHandler has to take the
+			// stopChan path rather than block.
+			for i := uint32(1); i <= 225; i++ {
 				pods = append(pods, newPod(fmt.Sprintf("pod%d", i), "default"))
 			}
 			wf, err = NewOVNKubeControllerWatchFactory(ovnClientset, "test-node")
@@ -1418,21 +1419,6 @@ var _ = Describe("Watch Factory Operations", func() {
 		err = wf.Start()
 		Expect(err).NotTo(HaveOccurred())
 
-		startWg := sync.WaitGroup{}
-		startWg.Add(1)
-		doneWg := sync.WaitGroup{}
-		doneWg.Add(1)
-		go func() {
-			startWg.Done()
-			// Send an update event for each namespace
-			for _, n := range namespaces {
-				n.Status.Phase = corev1.NamespaceTerminating
-				namespaceWatch.Modify(n)
-			}
-			doneWg.Done()
-		}()
-		startWg.Wait()
-
 		h, c := addHandler(wf, NamespaceType, cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				defer GinkgoRecover()
@@ -1459,7 +1445,16 @@ var _ = Describe("Watch Factory Operations", func() {
 			},
 			DeleteFunc: func(interface{}) {},
 		})
-		doneWg.Wait()
+
+		done := make(chan bool)
+		go func() {
+			// Send an update event for each namespace
+			for _, n := range namespaces {
+				n.Status.Phase = corev1.NamespaceTerminating
+				namespaceWatch.Modify(n)
+			}
+			done <- true
+		}()
 
 		// Adds are done synchronously at handler addition time
 		for _, ot := range testNamespaces {
@@ -1469,6 +1464,7 @@ var _ = Describe("Watch Factory Operations", func() {
 		}
 		Expect(c.getAdded()).To(Equal(len(testNamespaces)))
 
+		<-done
 		// Updates are async and may take a bit longer to finish
 		Eventually(c.getUpdated, 10).Should(Equal(len(testNamespaces)))
 		for _, ot := range testNamespaces {
