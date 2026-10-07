@@ -19,12 +19,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 	"sigs.k8s.io/knftables"
@@ -34,6 +34,7 @@ import (
 	honode "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/hybrid-overlay/pkg/controller"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni"
 	config "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	adminpolicybasedrouteclientset "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/adminpolicybasedroute/v1/apis/clientset/versioned"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/informer"
@@ -85,8 +86,9 @@ type BaseNodeNetworkController struct {
 	ovsClient client.Client
 
 	// stopChan and WaitGroup per controller
-	stopChan chan struct{}
-	wg       *sync.WaitGroup
+	stopChan   chan struct{}
+	wg         *sync.WaitGroup
+	stopCancel context.CancelFunc
 }
 
 func newCommonNodeNetworkControllerInfo(kubeClient clientset.Interface, kube kube.Interface, apbExternalRouteClient adminpolicybasedrouteclientset.Interface,
@@ -121,8 +123,9 @@ type DefaultNodeNetworkController struct {
 	routeManager  *routemanager.Controller
 	linkManager   *linkmanager.Controller
 
-	// retry framework for endpoint slices, used for the removal of stale conntrack entries for services
-	retryEndpointSlices *retry.RetryFramework
+	// queue and event handler for endpoint slices, used for the removal of stale conntrack entries for services
+	conntrackEndpointSliceQueue   workqueue.TypedRateLimitingInterface[*endpointSliceConntrackItem]
+	conntrackEndpointSliceHandler cache.ResourceEventHandlerRegistration
 
 	// retry framework for nodes, used for updating routes/nftables rules for node PMTUD guarding
 	retryNodes *retry.RetryFramework
@@ -153,6 +156,10 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 			ovsClient:                       ovsClient,
 		},
 		routeManager: routeManager,
+		conntrackEndpointSliceQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			controller.DefaultRateLimiter[*endpointSliceConntrackItem](),
+			workqueue.TypedRateLimitingQueueConfig[*endpointSliceConntrackItem]{Name: "node-conntrack-endpointslice"},
+		),
 	}
 	if util.IsNetworkSegmentationSupportEnabled() && (config.IsModeDPUHost() || config.IsModeFull()) {
 		c.udnHostIsolationManager = NewUDNHostIsolationManager(config.IPv4Mode, config.IPv6Mode,
@@ -174,6 +181,52 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 		}
 		return nil
 	})
+
+	if config.IsModeDPU() || config.IsModeFull() {
+		var err error
+		c.conntrackEndpointSliceHandler, err = c.watchFactory.EndpointSliceInformer().AddEventHandler(
+			factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+				UpdateFunc: func(oldObj, newObj interface{}) {
+					oldEPS, ok1 := oldObj.(*discovery.EndpointSlice)
+					newEPS, ok2 := newObj.(*discovery.EndpointSlice)
+					if !ok1 || !ok2 {
+						return
+					}
+					if util.IsNetworkSegmentationSupportEnabled() && newEPS.Labels[discovery.LabelServiceName] == "" {
+						return
+					}
+					c.conntrackEndpointSliceQueue.Add(&endpointSliceConntrackItem{
+						oldEndpointSlice: oldEPS,
+						newEndpointSlice: newEPS,
+					})
+				},
+				DeleteFunc: func(obj interface{}) {
+					eps, ok := obj.(*discovery.EndpointSlice)
+					if !ok {
+						tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+						if !ok {
+							return
+						}
+						eps, ok = tombstone.Obj.(*discovery.EndpointSlice)
+						if !ok {
+							return
+						}
+					}
+					if util.IsNetworkSegmentationSupportEnabled() && eps.Labels[discovery.LabelServiceName] == "" {
+						return
+					}
+					c.conntrackEndpointSliceQueue.Add(&endpointSliceConntrackItem{
+						oldEndpointSlice: eps,
+						newEndpointSlice: nil,
+					})
+				},
+			}),
+		)
+		if err != nil {
+			klog.Errorf("Failed to add EndpointSlice event handler for conntrack: %v", err)
+		}
+	}
+
 	return c
 }
 
@@ -236,7 +289,6 @@ func NewDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, net
 }
 
 func (nc *DefaultNodeNetworkController) initRetryFrameworkForNode() {
-	nc.retryEndpointSlices = nc.newRetryFrameworkNode(factory.EndpointSliceForStaleConntrackRemovalType)
 	nc.retryNodes = nc.newRetryFrameworkNode(factory.NodeType)
 }
 
@@ -1032,7 +1084,13 @@ func (nc *DefaultNodeNetworkController) Start(ctx context.Context) (err error) {
 	}
 
 	if config.IsModeDPU() || config.IsModeFull() {
-		err = nc.WatchEndpointSlices()
+		if nc.stopCancel != nil {
+			nc.stopCancel()
+		}
+		var runCtx context.Context
+		runCtx, nc.stopCancel = context.WithCancel(ctx)
+
+		err = nc.WatchEndpointSlices(runCtx, 1)
 		if err != nil {
 			return fmt.Errorf("failed to watch endpointSlices: %w", err)
 		}
@@ -1142,6 +1200,17 @@ func (nc *DefaultNodeNetworkController) Stop() {
 	}
 	close(nc.stopChan)
 	nc.stopChan = nil
+	if nc.conntrackEndpointSliceQueue != nil {
+		nc.conntrackEndpointSliceQueue.ShutDown()
+	}
+	if nc.stopCancel != nil {
+		nc.stopCancel()
+		nc.stopCancel = nil
+	}
+	if nc.conntrackEndpointSliceHandler != nil {
+		_ = nc.watchFactory.EndpointSliceInformer().RemoveEventHandler(nc.conntrackEndpointSliceHandler)
+		nc.conntrackEndpointSliceHandler = nil
+	}
 	nc.wg.Wait()
 }
 
@@ -1241,19 +1310,53 @@ func (nc *DefaultNodeNetworkController) reconcileConntrackUponEndpointSliceEvent
 	return utilerrors.Join(errors...)
 
 }
-func (nc *DefaultNodeNetworkController) WatchEndpointSlices() error {
-	if util.IsNetworkSegmentationSupportEnabled() {
-		// Filter out objects without the default serviceName label to exclude mirrored EndpointSlices
-		// Only default EndpointSlices contain the discovery.LabelServiceName label
-		req, err := labels.NewRequirement(discovery.LabelServiceName, selection.Exists, nil)
-		if err != nil {
-			return err
-		}
-		_, err = nc.retryEndpointSlices.WatchResourceFiltered("", labels.NewSelector().Add(*req))
-		return err
+
+type endpointSliceConntrackItem struct {
+	oldEndpointSlice *discovery.EndpointSlice
+	newEndpointSlice *discovery.EndpointSlice
+}
+
+func (nc *DefaultNodeNetworkController) runConntrackEndpointSliceWorker(ctx context.Context) {
+	for nc.processConntrackEndpointSliceItem(ctx) {
 	}
-	_, err := nc.retryEndpointSlices.WatchResource()
-	return err
+}
+
+func (nc *DefaultNodeNetworkController) processConntrackEndpointSliceItem(ctx context.Context) bool {
+	item, shutdown := nc.conntrackEndpointSliceQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer nc.conntrackEndpointSliceQueue.Done(item)
+
+	err := nc.reconcileConntrackUponEndpointSliceEvents(item.oldEndpointSlice, item.newEndpointSlice)
+	if err != nil {
+		if nc.conntrackEndpointSliceQueue.NumRequeues(item) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling conntrack for EndpointSlice %s/%s: %v, requeuing",
+				item.oldEndpointSlice.Namespace, item.oldEndpointSlice.Name, err)
+			nc.conntrackEndpointSliceQueue.AddRateLimited(item)
+			return true
+		}
+		klog.Errorf("Dropping EndpointSlice %s/%s conntrack flush out of queue: %v",
+			item.oldEndpointSlice.Namespace, item.oldEndpointSlice.Name, err)
+	}
+	nc.conntrackEndpointSliceQueue.Forget(item)
+	return true
+}
+
+func (nc *DefaultNodeNetworkController) WatchEndpointSlices(ctx context.Context, workers int) error {
+	if nc.conntrackEndpointSliceQueue == nil {
+		return fmt.Errorf("conntrackEndpointSliceQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		nc.wg.Add(1)
+		go func() {
+			defer nc.wg.Done()
+			wait.UntilWithContext(ctx, nc.runConntrackEndpointSliceWorker, time.Second)
+		}()
+	}
+
+	return nil
 }
 
 func (nc *DefaultNodeNetworkController) WatchNodes() error {
