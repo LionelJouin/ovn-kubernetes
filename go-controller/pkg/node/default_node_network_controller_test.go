@@ -23,6 +23,7 @@ import (
 	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
@@ -882,8 +883,7 @@ var _ = Describe("Node", func() {
 					Expect(err).NotTo(HaveOccurred())
 					wg := &sync.WaitGroup{}
 					defer func() {
-						close(stop)
-						wg.Wait()
+						nc.Stop()
 						wf.Shutdown()
 					}()
 
@@ -892,7 +892,6 @@ var _ = Describe("Node", func() {
 					routeManager := routemanager.NewController()
 					cnnci := NewCommonNodeNetworkControllerInfo(kubeFakeClient, fakeClient.AdminPolicyRouteClient, wf, nil, nodeName, routeManager)
 					nc = newDefaultNodeNetworkController(cnnci, stop, wg, routeManager, nil, nil)
-					nc.initRetryFrameworkForNode()
 					err = setupRemoteNodeNFTSets()
 					Expect(err).NotTo(HaveOccurred())
 					err = setupPMTUDNFTChain()
@@ -914,17 +913,19 @@ var _ = Describe("Node", func() {
 					}()
 					By("start up should add nftables rules for remote node")
 
-					err = nc.WatchNodes()
+					err = nc.WatchNodes(wait.ContextForChannel(stop), 1)
 					Expect(err).NotTo(HaveOccurred())
 					nftRules := v4PMTUDNFTRules + `
 add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.254.61 }
 `
-					err = nodenft.MatchNFTRules(nftRules, nft.Dump())
-					Expect(err).NotTo(HaveOccurred())
+					Eventually(func() error {
+						return nodenft.MatchNFTRules(nftRules, nft.Dump())
+					}).WithTimeout(2 * time.Second).ShouldNot(HaveOccurred())
 					gw := nc.Gateway.(*gateway)
 					By("start up should add openflow rules for remote node")
-					flows := gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
-					Expect(flows).To(HaveLen(1))
+					Eventually(func() []string {
+						return gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
+					}).WithTimeout(2 * time.Second).Should(HaveLen(1))
 
 					By("deleting the remote node should remove the nftables element")
 					err = kubeFakeClient.CoreV1().Nodes().Delete(context.TODO(), remoteNodeName, metav1.DeleteOptions{})
@@ -993,8 +994,7 @@ add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.254.61 }
 					Expect(err).NotTo(HaveOccurred())
 					wg := &sync.WaitGroup{}
 					defer func() {
-						close(stop)
-						wg.Wait()
+						nc.Stop()
 						wf.Shutdown()
 					}()
 
@@ -1003,7 +1003,6 @@ add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.254.61 }
 					routeManager := routemanager.NewController()
 					cnnci := NewCommonNodeNetworkControllerInfo(kubeFakeClient, fakeClient.AdminPolicyRouteClient, wf, nil, nodeName, routeManager)
 					nc = newDefaultNodeNetworkController(cnnci, stop, wg, routeManager, nil, nil)
-					nc.initRetryFrameworkForNode()
 					err = setupRemoteNodeNFTSets()
 					Expect(err).NotTo(HaveOccurred())
 					err = setupPMTUDNFTChain()
@@ -1025,17 +1024,19 @@ add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.254.61 }
 					}()
 					By("start up should add nftables rules for remote node")
 
-					err = nc.WatchNodes()
+					err = nc.WatchNodes(wait.ContextForChannel(stop), 1)
 					Expect(err).NotTo(HaveOccurred())
 					nftRules := v4PMTUDNFTRules + `
 add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.253.61 }
 `
-					err = nodenft.MatchNFTRules(nftRules, nft.Dump())
-					Expect(err).NotTo(HaveOccurred())
+					Eventually(func() error {
+						return nodenft.MatchNFTRules(nftRules, nft.Dump())
+					}).WithTimeout(2 * time.Second).ShouldNot(HaveOccurred())
 					gw := nc.Gateway.(*gateway)
 					By("start up should add openflow rules for remote node")
-					flows := gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
-					Expect(flows).To(HaveLen(1))
+					Eventually(func() []string {
+						return gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
+					}).WithTimeout(2 * time.Second).Should(HaveLen(1))
 
 					By("deleting the remote node should remove the nftables element")
 					err = kubeFakeClient.CoreV1().Nodes().Delete(context.TODO(), remoteNodeName, metav1.DeleteOptions{})
@@ -1146,8 +1147,7 @@ add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.253.61 }
 					Expect(err).NotTo(HaveOccurred())
 					wg := &sync.WaitGroup{}
 					defer func() {
-						close(stop)
-						wg.Wait()
+						nc.Stop()
 						wf.Shutdown()
 					}()
 
@@ -1156,7 +1156,6 @@ add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.253.61 }
 					routeManager := routemanager.NewController()
 					cnnci := NewCommonNodeNetworkControllerInfo(kubeFakeClient, fakeClient.AdminPolicyRouteClient, wf, nil, nodeName, routeManager)
 					nc = newDefaultNodeNetworkController(cnnci, stop, wg, routeManager, nil, nil)
-					nc.initRetryFrameworkForNode()
 					err = setupRemoteNodeNFTSets()
 					Expect(err).NotTo(HaveOccurred())
 					err = setupPMTUDNFTChain()
@@ -1178,17 +1177,19 @@ add element inet ovn-kubernetes remote-node-ips-v4 { 169.254.253.61 }
 					}()
 					By("start up should add nftables rules for remote node")
 
-					err = nc.WatchNodes()
+					err = nc.WatchNodes(wait.ContextForChannel(stop), 1)
 					Expect(err).NotTo(HaveOccurred())
 					nftRules := v6PMTUDNFTRules + `
 add element inet ovn-kubernetes remote-node-ips-v6 { 2001:db8:1::4 }
 `
-					err = nodenft.MatchNFTRules(nftRules, nft.Dump())
-					Expect(err).NotTo(HaveOccurred())
+					Eventually(func() error {
+						return nodenft.MatchNFTRules(nftRules, nft.Dump())
+					}).WithTimeout(2 * time.Second).ShouldNot(HaveOccurred())
 					gw := nc.Gateway.(*gateway)
 					By("start up should add openflow rules for remote node")
-					flows := gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
-					Expect(flows).To(HaveLen(1))
+					Eventually(func() []string {
+						return gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
+					}).WithTimeout(2 * time.Second).Should(HaveLen(1))
 
 					By("deleting the remote node should remove the nftables element")
 					err = kubeFakeClient.CoreV1().Nodes().Delete(context.TODO(), remoteNodeName, metav1.DeleteOptions{})
@@ -1256,8 +1257,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2001:db8:1::4 }
 					Expect(err).NotTo(HaveOccurred())
 					wg := &sync.WaitGroup{}
 					defer func() {
-						close(stop)
-						wg.Wait()
+						nc.Stop()
 						wf.Shutdown()
 					}()
 
@@ -1266,7 +1266,6 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2001:db8:1::4 }
 					routeManager := routemanager.NewController()
 					cnnci := NewCommonNodeNetworkControllerInfo(kubeFakeClient, fakeClient.AdminPolicyRouteClient, wf, nil, nodeName, routeManager)
 					nc = newDefaultNodeNetworkController(cnnci, stop, wg, routeManager, nil, nil)
-					nc.initRetryFrameworkForNode()
 					err = setupRemoteNodeNFTSets()
 					Expect(err).NotTo(HaveOccurred())
 					err = setupPMTUDNFTChain()
@@ -1288,17 +1287,19 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2001:db8:1::4 }
 					}()
 					By("start up should add nftables rules for remote node")
 
-					err = nc.WatchNodes()
+					err = nc.WatchNodes(wait.ContextForChannel(stop), 1)
 					Expect(err).NotTo(HaveOccurred())
 					nftRules := v6PMTUDNFTRules + `
 add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 `
-					err = nodenft.MatchNFTRules(nftRules, nft.Dump())
-					Expect(err).NotTo(HaveOccurred())
+					Eventually(func() error {
+						return nodenft.MatchNFTRules(nftRules, nft.Dump())
+					}).WithTimeout(2 * time.Second).ShouldNot(HaveOccurred())
 					gw := nc.Gateway.(*gateway)
 					By("start up should add openflow rules for remote node")
-					flows := gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
-					Expect(flows).To(HaveLen(1))
+					Eventually(func() []string {
+						return gw.openflowManager.getFlowsByKey(getPMTUDKey(remoteNodeName))
+					}).WithTimeout(2 * time.Second).Should(HaveLen(1))
 
 					By("deleting the remote node should remove the nftables element")
 					err = kubeFakeClient.CoreV1().Nodes().Delete(context.TODO(), remoteNodeName, metav1.DeleteOptions{})
@@ -1417,8 +1418,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					Expect(err).NotTo(HaveOccurred())
 					wg := &sync.WaitGroup{}
 					defer func() {
-						close(stop)
-						wg.Wait()
+						nc.Stop()
 						wf.Shutdown()
 					}()
 
@@ -1427,7 +1427,6 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					routeManager := routemanager.NewController()
 					cnnci := NewCommonNodeNetworkControllerInfo(kubeFakeClient, fakeClient.AdminPolicyRouteClient, wf, nil, nodeName, routeManager)
 					nc = newDefaultNodeNetworkController(cnnci, stop, wg, routeManager, nil, nil)
-					nc.initRetryFrameworkForNode()
 					err = setupRemoteNodeNFTSets()
 					Expect(err).NotTo(HaveOccurred())
 					err = setupPMTUDNFTChain()
@@ -1452,7 +1451,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					}()
 					By("no nftables elements should present at startup")
 
-					err = nc.WatchNodes()
+					err = nc.WatchNodes(wait.ContextForChannel(stop), 1)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(nft.Dump()).NotTo(ContainSubstring("add element inet ovn-kubernetes mgmtport-no-snat-subnets-v4 { 192.168.1.0/24 }"))
 					Expect(nft.Dump()).NotTo(ContainSubstring("add element inet ovn-kubernetes mgmtport-no-snat-subnets-v6 { fd00::/64 }"))
@@ -1538,8 +1537,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					Expect(err).NotTo(HaveOccurred())
 					wg := &sync.WaitGroup{}
 					defer func() {
-						close(stop)
-						wg.Wait()
+						nc.Stop()
 						wf.Shutdown()
 					}()
 
@@ -1548,7 +1546,6 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					routeManager := routemanager.NewController()
 					cnnci := NewCommonNodeNetworkControllerInfo(kubeFakeClient, fakeClient.AdminPolicyRouteClient, wf, nil, nodeName, routeManager)
 					nc = newDefaultNodeNetworkController(cnnci, stop, wg, routeManager, nil, nil)
-					nc.initRetryFrameworkForNode()
 					err = setupRemoteNodeNFTSets()
 					Expect(err).NotTo(HaveOccurred())
 					err = setupPMTUDNFTChain()
@@ -1573,10 +1570,10 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					}()
 					By("expected nftables elements should present at startup")
 
-					err = nc.WatchNodes()
+					err = nc.WatchNodes(wait.ContextForChannel(stop), 1)
 					Expect(err).NotTo(HaveOccurred())
-					Expect(nft.Dump()).To(ContainSubstring("add element inet ovn-kubernetes mgmtport-no-snat-subnets-v4 { 192.168.1.0/24 }"))
-					Expect(nft.Dump()).To(ContainSubstring("add element inet ovn-kubernetes mgmtport-no-snat-subnets-v6 { fd00::/64 }"))
+					Eventually(func() string { return nft.Dump() }).WithTimeout(2 * time.Second).Should(ContainSubstring("add element inet ovn-kubernetes mgmtport-no-snat-subnets-v4 { 192.168.1.0/24 }"))
+					Eventually(func() string { return nft.Dump() }).WithTimeout(2 * time.Second).Should(ContainSubstring("add element inet ovn-kubernetes mgmtport-no-snat-subnets-v6 { fd00::/64 }"))
 
 					By("editing subnets on node annotation should update nftables elements")
 					node.Annotations[util.OvnNodeDontSNATSubnets] = `["192.167.1.0/24"]`
