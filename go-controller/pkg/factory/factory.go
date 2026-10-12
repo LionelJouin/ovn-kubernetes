@@ -819,6 +819,10 @@ func (wf *WatchFactory) Stop() {
 
 // NewNodeWatchFactory initializes a watch factory with significantly fewer
 // informers to save memory + bandwidth. It is to be used by the node-only process.
+//
+// The pod informer is cluster-wide on purpose: multiple features need to look up remote pods
+// (e.g. APBRoute, UDN host isolation, EgressIP, EVPN, CNI live-migration IP preservation).
+// Node-local consumers can filter on pod.Spec.NodeName.
 func NewNodeWatchFactory(ovnClientset *util.OVNNodeClientset, nodeName string) (*WatchFactory, error) {
 	wf := &WatchFactory{
 		handlerCounter:       &handlerCounter{},
@@ -1860,12 +1864,6 @@ func (wf *WatchFactory) NodeInformer() cache.SharedIndexInformer {
 
 func (wf *WatchFactory) NodeCoreInformer() v1coreinformers.NodeInformer {
 	return wf.iFactory.Core().V1().Nodes()
-}
-
-// LocalPodInformer returns a shared Informer that may or may not only
-// return pods running on the local node.
-func (wf *WatchFactory) LocalPodInformer() cache.SharedIndexInformer {
-	return wf.informers[PodType].inf
 }
 
 func (wf *WatchFactory) PodInformer() cache.SharedIndexInformer {
