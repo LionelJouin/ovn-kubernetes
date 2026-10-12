@@ -144,7 +144,7 @@ type DefaultNodeNetworkController struct {
 }
 
 func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, stopChan chan struct{},
-	wg *sync.WaitGroup, routeManager *routemanager.Controller, networkManager networkmanager.Interface, ovsClient client.Client) *DefaultNodeNetworkController {
+	wg *sync.WaitGroup, routeManager *routemanager.Controller, networkManager networkmanager.Interface, ovsClient client.Client) (*DefaultNodeNetworkController, error) {
 
 	c := &DefaultNodeNetworkController{
 		BaseNodeNetworkController: BaseNodeNetworkController{
@@ -195,7 +195,7 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 			}),
 		)
 		if err != nil {
-			klog.Errorf("Failed to add EndpointSlice event handler for conntrack: %v", err)
+			return nil, fmt.Errorf("failed to add EndpointSlice event handler for conntrack: %w", err)
 		}
 
 		c.nodeHandler, err = c.watchFactory.NodeInformer().AddEventHandler(
@@ -206,11 +206,11 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 			}),
 		)
 		if err != nil {
-			klog.Errorf("Failed to add Node event handler: %v", err)
+			return nil, fmt.Errorf("failed to add Node event handler: %w", err)
 		}
 	}
 
-	return c
+	return c, nil
 }
 
 // NewDefaultNodeNetworkController creates a new network controller for node management of the default network
@@ -218,7 +218,10 @@ func NewDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, net
 	var err error
 	stopChan := make(chan struct{})
 	wg := &sync.WaitGroup{}
-	nc := newDefaultNodeNetworkController(cnnci, stopChan, wg, cnnci.routeManager, networkManager, ovsClient)
+	nc, err := newDefaultNodeNetworkController(cnnci, stopChan, wg, cnnci.routeManager, networkManager, ovsClient)
+	if err != nil {
+		return nil, err
+	}
 
 	if len(config.Kubernetes.HealthzBindAddress) != 0 {
 		klog.Infof("Enable node proxy healthz server on %s", config.Kubernetes.HealthzBindAddress)
