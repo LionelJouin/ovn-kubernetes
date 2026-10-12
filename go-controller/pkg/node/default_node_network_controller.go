@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
@@ -123,12 +124,14 @@ type DefaultNodeNetworkController struct {
 	linkManager   *linkmanager.Controller
 
 	// queue and event handler for endpoint slices, used for the removal of stale conntrack entries for services
-	conntrackEndpointSliceQueue   workqueue.TypedRateLimitingInterface[*endpointSliceConntrackItem]
+	conntrackEndpointSliceQueue   workqueue.TypedRateLimitingInterface[string]
 	conntrackEndpointSliceHandler cache.ResourceEventHandlerRegistration
+	conntrackEndpointSliceCache   sync.Map // map[string]*discovery.EndpointSlice
 
 	// queue and event handler for nodes, used for updating routes/nftables rules for node PMTUD guarding
-	nodeQueue   workqueue.TypedRateLimitingInterface[*nodeQueueItem]
-	nodeHandler cache.ResourceEventHandlerRegistration
+	nodeQueue     workqueue.TypedRateLimitingInterface[string]
+	nodeHandler   cache.ResourceEventHandlerRegistration
+	remoteNodeIPs sync.Map // map[string][]net.IP
 
 	dpuNodeLeaseManager *dpulease.Manager
 
@@ -157,12 +160,12 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 		},
 		routeManager: routeManager,
 		conntrackEndpointSliceQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
-			controller.DefaultRateLimiter[*endpointSliceConntrackItem](),
-			workqueue.TypedRateLimitingQueueConfig[*endpointSliceConntrackItem]{Name: "node-conntrack-endpointslice"},
+			controller.DefaultRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "node-conntrack-endpointslice"},
 		),
 		nodeQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
-			controller.DefaultRateLimiter[*nodeQueueItem](),
-			workqueue.TypedRateLimitingQueueConfig[*nodeQueueItem]{Name: "node-reconciler"},
+			controller.DefaultRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "node-reconciler"},
 		),
 	}
 	if util.IsNetworkSegmentationSupportEnabled() && (config.IsModeDPUHost() || config.IsModeFull()) {
@@ -190,11 +193,13 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 		var err error
 		c.conntrackEndpointSliceHandler, err = c.watchFactory.EndpointSliceInformer().AddEventHandler(
 			factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+				AddFunc:    c.onConntrackEndpointSliceAdd,
 				UpdateFunc: c.onConntrackEndpointSliceUpdate,
 				DeleteFunc: c.onConntrackEndpointSliceDelete,
 			}),
 		)
 		if err != nil {
+			c.Stop()
 			return nil, fmt.Errorf("failed to add EndpointSlice event handler for conntrack: %w", err)
 		}
 
@@ -206,6 +211,7 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 			}),
 		)
 		if err != nil {
+			c.Stop()
 			return nil, fmt.Errorf("failed to add Node event handler: %w", err)
 		}
 	}
@@ -222,6 +228,11 @@ func NewDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, net
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			nc.Stop()
+		}
+	}()
 
 	if len(config.Kubernetes.HealthzBindAddress) != 0 {
 		klog.Infof("Enable node proxy healthz server on %s", config.Kubernetes.HealthzBindAddress)
@@ -1290,24 +1301,34 @@ func (nc *DefaultNodeNetworkController) reconcileConntrackUponEndpointSliceEvent
 
 }
 
-type endpointSliceConntrackItem struct {
-	oldEndpointSlice *discovery.EndpointSlice
-	newEndpointSlice *discovery.EndpointSlice
+func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceAdd(obj interface{}) {
+	eps, ok := obj.(*discovery.EndpointSlice)
+	if !ok {
+		return
+	}
+	if util.IsNetworkSegmentationSupportEnabled() && eps.Labels[discovery.LabelServiceName] == "" {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(eps)
+	if err != nil {
+		return
+	}
+	nc.conntrackEndpointSliceCache.Store(key, eps)
 }
 
-func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceUpdate(oldObj, newObj interface{}) {
-	oldEPS, ok1 := oldObj.(*discovery.EndpointSlice)
-	newEPS, ok2 := newObj.(*discovery.EndpointSlice)
-	if !ok1 || !ok2 {
+func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceUpdate(_, newObj interface{}) {
+	newEPS, ok := newObj.(*discovery.EndpointSlice)
+	if !ok {
 		return
 	}
 	if util.IsNetworkSegmentationSupportEnabled() && newEPS.Labels[discovery.LabelServiceName] == "" {
 		return
 	}
-	nc.conntrackEndpointSliceQueue.Add(&endpointSliceConntrackItem{
-		oldEndpointSlice: oldEPS,
-		newEndpointSlice: newEPS,
-	})
+	key, err := cache.MetaNamespaceKeyFunc(newEPS)
+	if err != nil {
+		return
+	}
+	nc.conntrackEndpointSliceQueue.Add(key)
 }
 
 func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceDelete(obj interface{}) {
@@ -1325,10 +1346,11 @@ func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceDelete(obj inter
 	if util.IsNetworkSegmentationSupportEnabled() && eps.Labels[discovery.LabelServiceName] == "" {
 		return
 	}
-	nc.conntrackEndpointSliceQueue.Add(&endpointSliceConntrackItem{
-		oldEndpointSlice: eps,
-		newEndpointSlice: nil,
-	})
+	key, err := cache.MetaNamespaceKeyFunc(eps)
+	if err != nil {
+		return
+	}
+	nc.conntrackEndpointSliceQueue.Add(key)
 }
 
 func (nc *DefaultNodeNetworkController) runConntrackEndpointSliceWorker(_ context.Context) {
@@ -1337,25 +1359,60 @@ func (nc *DefaultNodeNetworkController) runConntrackEndpointSliceWorker(_ contex
 }
 
 func (nc *DefaultNodeNetworkController) processConntrackEndpointSliceItem() bool {
-	item, shutdown := nc.conntrackEndpointSliceQueue.Get()
+	key, shutdown := nc.conntrackEndpointSliceQueue.Get()
 	if shutdown {
 		return false
 	}
-	defer nc.conntrackEndpointSliceQueue.Done(item)
+	defer nc.conntrackEndpointSliceQueue.Done(key)
 
-	err := nc.reconcileConntrackUponEndpointSliceEvents(item.oldEndpointSlice, item.newEndpointSlice)
+	err := nc.reconcileEndpointSliceConntrack(key)
 	if err != nil {
-		if nc.conntrackEndpointSliceQueue.NumRequeues(item) < controller.DefaultMaxAttempts {
-			klog.V(4).Infof("Error reconciling conntrack for EndpointSlice %s/%s: %v, requeuing",
-				item.oldEndpointSlice.Namespace, item.oldEndpointSlice.Name, err)
-			nc.conntrackEndpointSliceQueue.AddRateLimited(item)
+		if nc.conntrackEndpointSliceQueue.NumRequeues(key) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling conntrack for EndpointSlice %s: %v, requeuing", key, err)
+			nc.conntrackEndpointSliceQueue.AddRateLimited(key)
 			return true
 		}
-		klog.Errorf("Dropping EndpointSlice %s/%s conntrack flush out of queue: %v",
-			item.oldEndpointSlice.Namespace, item.oldEndpointSlice.Name, err)
+		klog.Errorf("Dropping EndpointSlice %s conntrack flush out of queue: %v", key, err)
 	}
-	nc.conntrackEndpointSliceQueue.Forget(item)
+	nc.conntrackEndpointSliceQueue.Forget(key)
 	return true
+}
+
+func (nc *DefaultNodeNetworkController) reconcileEndpointSliceConntrack(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	curEPS, err := nc.watchFactory.GetEndpointSlice(namespace, name)
+	oldVal, hadOld := nc.conntrackEndpointSliceCache.Load(key)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if hadOld {
+				oldEPS := oldVal.(*discovery.EndpointSlice)
+				if err := nc.reconcileConntrackUponEndpointSliceEvents(oldEPS, nil); err != nil {
+					return err
+				}
+				nc.conntrackEndpointSliceCache.Delete(key)
+				return nil
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get EndpointSlice %s: %w", key, err)
+	}
+
+	if hadOld {
+		oldEPS := oldVal.(*discovery.EndpointSlice)
+		if err := nc.reconcileConntrackUponEndpointSliceEvents(oldEPS, curEPS); err != nil {
+			return err
+		}
+		nc.conntrackEndpointSliceCache.Store(key, curEPS)
+		return nil
+	}
+
+	nc.conntrackEndpointSliceCache.Store(key, curEPS)
+	return nil
 }
 
 func (nc *DefaultNodeNetworkController) WatchEndpointSlices(ctx context.Context, workers int) error {
@@ -1374,19 +1431,12 @@ func (nc *DefaultNodeNetworkController) WatchEndpointSlices(ctx context.Context,
 	return nil
 }
 
-type nodeQueueItem struct {
-	oldNode *corev1.Node
-	newNode *corev1.Node
-}
-
 func (nc *DefaultNodeNetworkController) onNodeAdd(obj interface{}) {
 	node, ok := obj.(*corev1.Node)
 	if !ok {
 		return
 	}
-	nc.nodeQueue.Add(&nodeQueueItem{
-		newNode: node,
-	})
+	nc.nodeQueue.Add(node.Name)
 }
 
 func (nc *DefaultNodeNetworkController) onNodeUpdate(oldObj, newObj interface{}) {
@@ -1399,10 +1449,7 @@ func (nc *DefaultNodeNetworkController) onNodeUpdate(oldObj, newObj interface{})
 		reflect.DeepEqual(oldNode.Annotations, newNode.Annotations) {
 		return
 	}
-	nc.nodeQueue.Add(&nodeQueueItem{
-		oldNode: oldNode,
-		newNode: newNode,
-	})
+	nc.nodeQueue.Add(newNode.Name)
 }
 
 func (nc *DefaultNodeNetworkController) onNodeDelete(obj interface{}) {
@@ -1417,9 +1464,7 @@ func (nc *DefaultNodeNetworkController) onNodeDelete(obj interface{}) {
 			return
 		}
 	}
-	nc.nodeQueue.Add(&nodeQueueItem{
-		oldNode: node,
-	})
+	nc.nodeQueue.Add(node.Name)
 }
 
 func (nc *DefaultNodeNetworkController) runNodeWorker(_ context.Context) {
@@ -1428,29 +1473,22 @@ func (nc *DefaultNodeNetworkController) runNodeWorker(_ context.Context) {
 }
 
 func (nc *DefaultNodeNetworkController) processNodeItem() bool {
-	item, shutdown := nc.nodeQueue.Get()
+	nodeName, shutdown := nc.nodeQueue.Get()
 	if shutdown {
 		return false
 	}
-	defer nc.nodeQueue.Done(item)
+	defer nc.nodeQueue.Done(nodeName)
 
-	nodeName := ""
-	if item.newNode != nil {
-		nodeName = item.newNode.Name
-	} else if item.oldNode != nil {
-		nodeName = item.oldNode.Name
-	}
-
-	err := nc.reconcileNode(item.oldNode, item.newNode)
+	err := nc.reconcileNode(nodeName)
 	if err != nil {
-		if nc.nodeQueue.NumRequeues(item) < controller.DefaultMaxAttempts {
+		if nc.nodeQueue.NumRequeues(nodeName) < controller.DefaultMaxAttempts {
 			klog.V(4).Infof("Error reconciling node %s: %v, requeuing", nodeName, err)
-			nc.nodeQueue.AddRateLimited(item)
+			nc.nodeQueue.AddRateLimited(nodeName)
 			return true
 		}
 		klog.Errorf("Dropping node %s out of queue after %d attempts: %v", nodeName, controller.DefaultMaxAttempts, err)
 	}
-	nc.nodeQueue.Forget(item)
+	nc.nodeQueue.Forget(nodeName)
 	return true
 }
 
@@ -1482,132 +1520,128 @@ func (nc *DefaultNodeNetworkController) WatchNodes(ctx context.Context, workers 
 	return nil
 }
 
-func (nc *DefaultNodeNetworkController) reconcileNode(oldNode, newNode *corev1.Node) error {
-	if oldNode == nil && newNode == nil {
+func (nc *DefaultNodeNetworkController) reconcileNode(nodeName string) error {
+	node, err := nc.watchFactory.GetNode(nodeName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nc.deleteNode(nodeName)
+		}
+		return fmt.Errorf("failed to get node %s from informer: %w", nodeName, err)
+	}
+
+	if node.Name == nc.name {
+		return nc.reconcileLocalNode(node)
+	}
+	return nc.reconcileRemoteNode(node)
+}
+
+func (nc *DefaultNodeNetworkController) reconcileLocalNode(node *corev1.Node) error {
+	if config.IsModeDPUHost() || config.IsModeFull() {
+		if util.NodeDontSNATSubnetAnnotationExist(node) {
+			err := managementport.UpdateNoSNATSubnetsSets(node, util.ParseNodeDontSNATSubnetsList)
+			if err != nil {
+				return fmt.Errorf("error updating no snat subnets sets: %w", err)
+			}
+		}
+
+		// Sync nftables sets for no-overlay SNAT exemption in LGW mode.
+		// In SGW mode, OVN address sets are used instead.
+		if config.Default.Transport == types.NetworkTransportNoOverlay && config.NoOverlay.OutboundSNAT == types.NoOverlaySNATEnabled && config.Gateway.Mode == config.GatewayModeLocal {
+			hostAddrs, err := util.GetNodeHostAddrs(node)
+			if err != nil {
+				return fmt.Errorf("failed to get host addresses for node %s: %w", node.Name, err)
+			}
+			if err := syncNoOverlaySNATExemptNFTSets(hostAddrs); err != nil {
+				return fmt.Errorf("failed to sync no-overlay SNAT exemption nftables sets: %w", err)
+			}
+		}
+	}
+
+	// On the DPU, the host (DPUHost) publishes its primary interface address via the
+	// primary-dpu-host-addr annotation. When it changes we must rebuild
+	// node-primary-ifaddr and l3-gateway-config from it: only the DPU holds the
+	// OVS/OVN state (chassis, bridge, MAC, ofport) required to author l3-gateway-config,
+	// so the host cannot do it. We piggyback on this existing local-node watch rather
+	// than registering a separate node informer handler.
+	if config.OvnKubeNode.Mode == types.NodeModeDPU && node.Annotations[util.OVNNodePrimaryDPUHostAddr] != "" {
+		if gw, ok := nc.Gateway.(*gateway); ok && gw.nodeIPManager != nil {
+			if err := gw.nodeIPManager.updateGatewayAddressAnnotations(); err != nil {
+				return fmt.Errorf("failed to update gateway annotations after primary-dpu-host-addr change for node %s: %w", node.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (nc *DefaultNodeNetworkController) reconcileRemoteNode(node *corev1.Node) error {
+	newIPsv4, newIPsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, node)
+	if err != nil {
+		return fmt.Errorf("failed to get addresses for node %q: %w", node.Name, err)
+	}
+
+	newIPs := make([]net.IP, 0, len(newIPsv4)+len(newIPsv6))
+	newIPs = append(newIPs, newIPsv4...)
+	newIPs = append(newIPs, newIPsv6...)
+
+	ipsToKeep := map[string]bool{}
+	for _, ip := range newIPs {
+		ipsToKeep[ip.String()] = true
+	}
+
+	if config.IsModeDPUHost() || config.IsModeFull() {
+		if oldIPsVal, ok := nc.remoteNodeIPs.Load(node.Name); ok {
+			oldIPs := oldIPsVal.([]net.IP)
+			ipsToRemove := make([]net.IP, 0)
+			for _, oldIP := range oldIPs {
+				if !ipsToKeep[oldIP.String()] {
+					ipsToRemove = append(ipsToRemove, oldIP)
+				}
+			}
+			if len(ipsToRemove) > 0 {
+				if err := removePMTUDNodeNFTRules(ipsToRemove); err != nil {
+					return fmt.Errorf("error removing node %q stale NFT rules during update: %w", node.Name, err)
+				}
+			}
+		}
+	}
+
+	if err := nc.addOrUpdateNode(node); err != nil {
+		return err
+	}
+
+	nc.remoteNodeIPs.Store(node.Name, newIPs)
+	return nil
+}
+
+func (nc *DefaultNodeNetworkController) deleteNode(nodeName string) error {
+	if config.IsModeDPU() && nodeName == nc.name {
+		// In DPU mode the process does not run on the deleted node, so nothing
+		// else stops it, and what it wrote to the Node object is only written at
+		// startup: exit and let the container restart against the new node.
+		ownNodeDeletedExit(nc.name)
 		return nil
 	}
 
-	// Delete
-	if newNode == nil {
-		nc.deleteNode(oldNode)
-		if config.IsModeDPUHost() || config.IsModeFull() {
-			_ = managementport.UpdateNoSNATSubnetsSets(oldNode, func(_ *corev1.Node) ([]string, error) {
-				return []string{}, nil
-			})
-		}
-		return nil
+	if gw, ok := nc.Gateway.(*gateway); ok && gw.openflowManager != nil {
+		gw.openflowManager.deleteFlowsByKey(getPMTUDKey(nodeName))
 	}
 
-	// Add
-	if oldNode == nil {
-		if newNode.Name == nc.name {
-			if config.IsModeDPUHost() || config.IsModeFull() {
-				if util.NodeDontSNATSubnetAnnotationExist(newNode) {
-					err := managementport.UpdateNoSNATSubnetsSets(newNode, util.ParseNodeDontSNATSubnetsList)
-					if err != nil {
-						return fmt.Errorf("error updating no snat subnets sets: %w", err)
-					}
-				}
-
-				// Sync nftables sets for no-overlay SNAT exemption in LGW mode.
-				// In SGW mode, OVN address sets are used instead.
-				if config.Default.Transport == types.NetworkTransportNoOverlay && config.NoOverlay.OutboundSNAT == types.NoOverlaySNATEnabled && config.Gateway.Mode == config.GatewayModeLocal {
-					hostAddrs, err := util.GetNodeHostAddrs(newNode)
-					if err != nil {
-						return fmt.Errorf("failed to get host addresses for node %s: %w", newNode.Name, err)
-					}
-					if err := syncNoOverlaySNATExemptNFTSets(hostAddrs); err != nil {
-						return fmt.Errorf("failed to sync no-overlay SNAT exemption nftables sets: %w", err)
-					}
-				}
-			}
-
-			return nil
-		}
-		return nc.addOrUpdateNode(newNode)
-	}
-
-	// Update
-	if newNode.Name == nc.name {
-		if (config.IsModeDPUHost() || config.IsModeFull()) && !reflect.DeepEqual(oldNode.Annotations, newNode.Annotations) {
-			// if node's dont SNAT subnet annotation changed sync nftables
-			if util.NodeDontSNATSubnetAnnotationChanged(oldNode, newNode) {
-				err := managementport.UpdateNoSNATSubnetsSets(newNode, util.ParseNodeDontSNATSubnetsList)
-				if err != nil {
-					return fmt.Errorf("error updating no snat subnets sets: %w", err)
-				}
-			}
-
-			// Sync nftables sets for no-overlay SNAT exemption in LGW mode if host addresses annotation changed.
-			// In SGW mode, OVN address sets are used instead.
-			if config.Default.Transport == types.NetworkTransportNoOverlay && config.NoOverlay.OutboundSNAT == types.NoOverlaySNATEnabled && config.Gateway.Mode == config.GatewayModeLocal {
-				if util.NodeHostCIDRsAnnotationChanged(oldNode, newNode) {
-					hostAddrs, err := util.GetNodeHostAddrs(newNode)
-					if err != nil {
-						return fmt.Errorf("failed to get host addresses for node %s: %w", newNode.Name, err)
-					}
-					if err := syncNoOverlaySNATExemptNFTSets(hostAddrs); err != nil {
-						return fmt.Errorf("failed to sync no-overlay SNAT exemption nftables sets: %w", err)
-					}
-				}
-			}
-		}
-
-		// On the DPU, the host (DPUHost) publishes its primary interface address via the
-		// primary-dpu-host-addr annotation. When it changes we must rebuild
-		// node-primary-ifaddr and l3-gateway-config from it: only the DPU holds the
-		// OVS/OVN state (chassis, bridge, MAC, ofport) required to author l3-gateway-config,
-		// so the host cannot do it. We piggyback on this existing local-node watch rather
-		// than registering a separate node informer handler.
-		if config.OvnKubeNode.Mode == types.NodeModeDPU && util.NodePrimaryDPUHostAddrAnnotationChanged(oldNode, newNode) {
-			if gw, ok := nc.Gateway.(*gateway); ok && gw.nodeIPManager != nil {
-				if err := gw.nodeIPManager.updateGatewayAddressAnnotations(); err != nil {
-					return fmt.Errorf("failed to update gateway annotations after primary-dpu-host-addr change for node %s: %w", newNode.Name, err)
-				}
-			}
-		}
-		return nil
-	}
-
-	if (config.IsModeDPUHost() || config.IsModeFull()) && util.NodeHostCIDRsAnnotationChanged(oldNode, newNode) {
-		// remote node that is changing
-		// Use GetNodeAddresses to get new node IPs
-		newIPsv4, newIPsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, newNode)
-		if err != nil {
-			return fmt.Errorf("failed to get addresses for new node %q: %w", newNode.Name, err)
-		}
-
-		ipsToKeep := map[string]bool{}
-		for _, nodeIP := range newIPsv4 {
-			ipsToKeep[nodeIP.String()] = true
-		}
-		for _, nodeIP := range newIPsv6 {
-			ipsToKeep[nodeIP.String()] = true
-		}
-
-		// Use GetNodeAddresses to get old node IPs
-		oldIPsv4, oldIPsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, oldNode)
-		if err != nil {
-			return fmt.Errorf("failed to get addresses for old node %q: %w", oldNode.Name, err)
-		}
-
-		ipsToRemove := make([]net.IP, 0)
-		for _, nodeIP := range oldIPsv4 {
-			if _, exists := ipsToKeep[nodeIP.String()]; !exists {
-				ipsToRemove = append(ipsToRemove, nodeIP)
-			}
-		}
-		for _, nodeIP := range oldIPsv6 {
-			if _, exists := ipsToKeep[nodeIP.String()]; !exists {
-				ipsToRemove = append(ipsToRemove, nodeIP)
-			}
-		}
-
+	if oldIPsVal, ok := nc.remoteNodeIPs.Load(nodeName); ok {
+		ipsToRemove := oldIPsVal.([]net.IP)
+		klog.Infof("Deleting NFT elements for node: %s", nodeName)
 		if err := removePMTUDNodeNFTRules(ipsToRemove); err != nil {
-			return fmt.Errorf("error removing node %q stale NFT rules during update: %w", oldNode.Name, err)
+			return fmt.Errorf("failed to delete nftables rules for PMTUD blocking for node %q: %w", nodeName, err)
 		}
+		nc.remoteNodeIPs.Delete(nodeName)
 	}
-	return nc.addOrUpdateNode(newNode)
+
+	if nodeName == nc.name && (config.IsModeDPUHost() || config.IsModeFull()) {
+		_ = managementport.UpdateNoSNATSubnetsSets(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}, func(_ *corev1.Node) ([]string, error) {
+			return []string{}, nil
+		})
+	}
+
+	return nil
 }
 
 // addOrUpdateNode handles creating flows or nftables rules for each node to handle PMTUD
@@ -1690,35 +1724,6 @@ var ownNodeDeletedExit = func(nodeName string) {
 	klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 }
 
-func (nc *DefaultNodeNetworkController) deleteNode(node *corev1.Node) {
-	if config.IsModeDPU() && node.Name == nc.name {
-		// In DPU mode the process does not run on the deleted node, so nothing
-		// else stops it, and what it wrote to the Node object is only written at
-		// startup: exit and let the container restart against the new node.
-		ownNodeDeletedExit(nc.name)
-		return
-	}
-
-	gw := nc.Gateway.(*gateway)
-	gw.openflowManager.deleteFlowsByKey(getPMTUDKey(node.Name))
-
-	// Use GetNodeAddresses to get node IPs
-	ipsv4, ipsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, node)
-	if err != nil {
-		klog.Errorf("Failed to get node addresses for node %q: %v", node.Name, err)
-		return
-	}
-
-	ipsToRemove := make([]net.IP, 0, len(ipsv4)+len(ipsv6))
-	ipsToRemove = append(ipsToRemove, ipsv4...)
-	ipsToRemove = append(ipsToRemove, ipsv6...)
-
-	klog.Infof("Deleting NFT elements for node: %s", node.Name)
-	if err := removePMTUDNodeNFTRules(ipsToRemove); err != nil {
-		klog.Errorf("Failed to delete nftables rules for PMTUD blocking for node %q: %v", node.Name, err)
-	}
-}
-
 var nodeIPSets = []knftables.Object{
 	&knftables.Set{
 		Name: types.NFTRemoteNodeIPsv4,
@@ -1755,6 +1760,11 @@ func (nc *DefaultNodeNetworkController) syncNodes(objs []interface{}) error {
 		}
 
 		// Process IPv4 addresses
+		nodeIPs := make([]net.IP, 0, len(ipsv4)+len(ipsv6))
+		nodeIPs = append(nodeIPs, ipsv4...)
+		nodeIPs = append(nodeIPs, ipsv6...)
+		nc.remoteNodeIPs.Store(node.Name, nodeIPs)
+
 		for _, nodeIP := range ipsv4 {
 			keepNFTSetElems = append(keepNFTSetElems, &knftables.Element{
 				Set: types.NFTRemoteNodeIPsv4,
