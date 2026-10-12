@@ -144,6 +144,8 @@ type DefaultNodeNetworkController struct {
 	masqReconciler *masqueradeReconciler
 
 	nodeAddress net.IP
+
+	primaryDPUHostAddr string
 }
 
 func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, stopChan chan struct{},
@@ -950,6 +952,9 @@ func (nc *DefaultNodeNetworkController) Init(ctx context.Context) error {
 			return err
 		}
 		nc.Gateway = gw
+		if config.IsModeDPU() {
+			nc.primaryDPUHostAddr = node.Annotations[util.OVNNodePrimaryDPUHostAddr]
+		}
 	} else {
 		err = nc.initGatewayDPUHostPreStart(nc.nodeAddress, nodeAnnotator)
 		if err != nil {
@@ -1313,16 +1318,20 @@ func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceAdd(obj interfac
 	if err != nil {
 		return
 	}
-	nc.conntrackEndpointSliceCache.Store(key, eps)
+	// Keep a pending prior state; the worker advances the cache after reconciling.
+	nc.conntrackEndpointSliceCache.LoadOrStore(key, eps)
 }
 
-func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceUpdate(_, newObj interface{}) {
+func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceUpdate(oldObj, newObj interface{}) {
 	newEPS, ok := newObj.(*discovery.EndpointSlice)
 	if !ok {
 		return
 	}
 	if util.IsNetworkSegmentationSupportEnabled() && newEPS.Labels[discovery.LabelServiceName] == "" {
-		return
+		oldEPS, oldOK := oldObj.(*discovery.EndpointSlice)
+		if !oldOK || oldEPS.Labels[discovery.LabelServiceName] == "" {
+			return
+		}
 	}
 	key, err := cache.MetaNamespaceKeyFunc(newEPS)
 	if err != nil {
@@ -1373,6 +1382,11 @@ func (nc *DefaultNodeNetworkController) processConntrackEndpointSliceItem() bool
 			return true
 		}
 		klog.Errorf("Dropping EndpointSlice %s conntrack flush out of queue: %v", key, err)
+		if ns, name, splitErr := cache.SplitMetaNamespaceKey(key); splitErr == nil {
+			if curEPS, getErr := nc.watchFactory.GetEndpointSlice(ns, name); apierrors.IsNotFound(getErr) || (getErr == nil && util.IsNetworkSegmentationSupportEnabled() && curEPS.Labels[discovery.LabelServiceName] == "") {
+				nc.conntrackEndpointSliceCache.Delete(key)
+			}
+		}
 	}
 	nc.conntrackEndpointSliceQueue.Forget(key)
 	return true
@@ -1384,8 +1398,8 @@ func (nc *DefaultNodeNetworkController) reconcileEndpointSliceConntrack(key stri
 		return fmt.Errorf("failed to split key %s: %w", key, err)
 	}
 
-	curEPS, err := nc.watchFactory.GetEndpointSlice(namespace, name)
 	oldVal, hadOld := nc.conntrackEndpointSliceCache.Load(key)
+	curEPS, err := nc.watchFactory.GetEndpointSlice(namespace, name)
 
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -1394,12 +1408,23 @@ func (nc *DefaultNodeNetworkController) reconcileEndpointSliceConntrack(key stri
 				if err := nc.reconcileConntrackUponEndpointSliceEvents(oldEPS, nil); err != nil {
 					return err
 				}
-				nc.conntrackEndpointSliceCache.Delete(key)
+				nc.conntrackEndpointSliceCache.CompareAndDelete(key, oldVal)
 				return nil
 			}
 			return nil
 		}
 		return fmt.Errorf("failed to get EndpointSlice %s: %w", key, err)
+	}
+
+	if util.IsNetworkSegmentationSupportEnabled() && curEPS.Labels[discovery.LabelServiceName] == "" {
+		if hadOld {
+			oldEPS := oldVal.(*discovery.EndpointSlice)
+			if err := nc.reconcileConntrackUponEndpointSliceEvents(oldEPS, nil); err != nil {
+				return err
+			}
+			nc.conntrackEndpointSliceCache.CompareAndDelete(key, oldVal)
+		}
+		return nil
 	}
 
 	if hadOld {
@@ -1487,6 +1512,9 @@ func (nc *DefaultNodeNetworkController) processNodeItem() bool {
 			return true
 		}
 		klog.Errorf("Dropping node %s out of queue after %d attempts: %v", nodeName, controller.DefaultMaxAttempts, err)
+		if _, getErr := nc.watchFactory.GetNode(nodeName); apierrors.IsNotFound(getErr) {
+			nc.remoteNodeIPs.Delete(nodeName)
+		}
 	}
 	nc.nodeQueue.Forget(nodeName)
 	return true
@@ -1537,11 +1565,9 @@ func (nc *DefaultNodeNetworkController) reconcileNode(nodeName string) error {
 
 func (nc *DefaultNodeNetworkController) reconcileLocalNode(node *corev1.Node) error {
 	if config.IsModeDPUHost() || config.IsModeFull() {
-		if util.NodeDontSNATSubnetAnnotationExist(node) {
-			err := managementport.UpdateNoSNATSubnetsSets(node, util.ParseNodeDontSNATSubnetsList)
-			if err != nil {
-				return fmt.Errorf("error updating no snat subnets sets: %w", err)
-			}
+		err := managementport.UpdateNoSNATSubnetsSets(node, util.ParseNodeDontSNATSubnetsList)
+		if err != nil {
+			return fmt.Errorf("error updating no snat subnets sets: %w", err)
 		}
 
 		// Sync nftables sets for no-overlay SNAT exemption in LGW mode.
@@ -1563,11 +1589,17 @@ func (nc *DefaultNodeNetworkController) reconcileLocalNode(node *corev1.Node) er
 	// OVS/OVN state (chassis, bridge, MAC, ofport) required to author l3-gateway-config,
 	// so the host cannot do it. We piggyback on this existing local-node watch rather
 	// than registering a separate node informer handler.
-	if config.OvnKubeNode.Mode == types.NodeModeDPU && node.Annotations[util.OVNNodePrimaryDPUHostAddr] != "" {
-		if gw, ok := nc.Gateway.(*gateway); ok && gw.nodeIPManager != nil {
-			if err := gw.nodeIPManager.updateGatewayAddressAnnotations(); err != nil {
-				return fmt.Errorf("failed to update gateway annotations after primary-dpu-host-addr change for node %s: %w", node.Name, err)
+	if config.OvnKubeNode.Mode == types.NodeModeDPU {
+		dpuHostAddr := node.Annotations[util.OVNNodePrimaryDPUHostAddr]
+		if dpuHostAddr != nc.primaryDPUHostAddr {
+			if dpuHostAddr != "" {
+				if gw, ok := nc.Gateway.(*gateway); ok && gw.nodeIPManager != nil {
+					if err := gw.nodeIPManager.updateGatewayAddressAnnotations(); err != nil {
+						return fmt.Errorf("failed to update gateway annotations after primary-dpu-host-addr change for node %s: %w", node.Name, err)
+					}
+				}
 			}
+			nc.primaryDPUHostAddr = dpuHostAddr
 		}
 	}
 	return nil
@@ -1627,18 +1659,22 @@ func (nc *DefaultNodeNetworkController) deleteNode(nodeName string) error {
 	}
 
 	if oldIPsVal, ok := nc.remoteNodeIPs.Load(nodeName); ok {
-		ipsToRemove := oldIPsVal.([]net.IP)
-		klog.Infof("Deleting NFT elements for node: %s", nodeName)
-		if err := removePMTUDNodeNFTRules(ipsToRemove); err != nil {
-			return fmt.Errorf("failed to delete nftables rules for PMTUD blocking for node %q: %w", nodeName, err)
+		if config.IsModeDPUHost() || config.IsModeFull() {
+			ipsToRemove := oldIPsVal.([]net.IP)
+			klog.Infof("Deleting NFT elements for node: %s", nodeName)
+			if err := removePMTUDNodeNFTRules(ipsToRemove); err != nil {
+				return fmt.Errorf("failed to delete nftables rules for PMTUD blocking for node %q: %w", nodeName, err)
+			}
 		}
 		nc.remoteNodeIPs.Delete(nodeName)
 	}
 
 	if nodeName == nc.name && (config.IsModeDPUHost() || config.IsModeFull()) {
-		_ = managementport.UpdateNoSNATSubnetsSets(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}, func(_ *corev1.Node) ([]string, error) {
+		if err := managementport.UpdateNoSNATSubnetsSets(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}, func(_ *corev1.Node) ([]string, error) {
 			return []string{}, nil
-		})
+		}); err != nil {
+			return fmt.Errorf("failed to reset no-SNAT subnets for node %q: %w", nodeName, err)
+		}
 	}
 
 	return nil
@@ -1686,8 +1722,9 @@ func (nc *DefaultNodeNetworkController) addOrUpdateNode(node *corev1.Node) error
 		}
 	}
 
-	gw := nc.Gateway.(*gateway)
-	gw.openflowManager.updateBridgePMTUDFlowCache(getPMTUDKey(node.Name), addrs)
+	if gw, ok := nc.Gateway.(*gateway); ok && gw.openflowManager != nil {
+		gw.openflowManager.updateBridgePMTUDFlowCache(getPMTUDKey(node.Name), addrs)
+	}
 
 	return nil
 }
