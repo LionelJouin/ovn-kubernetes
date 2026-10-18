@@ -1142,6 +1142,9 @@ func (nc *DefaultNodeNetworkController) Stop() {
 	}
 	close(nc.stopChan)
 	nc.stopChan = nil
+	if nc.Gateway != nil {
+		nc.Gateway.Stop()
+	}
 	nc.wg.Wait()
 }
 

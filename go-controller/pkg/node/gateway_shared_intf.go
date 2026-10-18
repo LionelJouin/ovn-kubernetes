@@ -1812,7 +1812,7 @@ func newGateway(
 				npw.updateGatewayIPs()
 			}
 			// Services create OpenFlow flows as well, need to update them all
-			if gw.servicesRetryFramework != nil {
+			if gw.serviceQueue != nil {
 				if errs := gw.resyncAllServices(); len(errs) > 0 {
 					err := utilerrors.Join(errs...)
 					klog.Errorf("Failed to sync all services after node IP change: %v", err)
@@ -1838,6 +1838,9 @@ func newGateway(
 		return nil
 	}
 	gw.watchFactory = watchFactory.(*factory.WatchFactory)
+	if err := gw.initHandlers(); err != nil {
+		return nil, err
+	}
 	klog.Info("Gateway Creation Complete")
 	return gw, nil
 }
