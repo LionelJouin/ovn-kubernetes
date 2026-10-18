@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -174,11 +175,18 @@ func (mic *MarkIPsCache) setSyncdOnce() {
 	mic.mu.Unlock()
 }
 
+type eipAssignment struct {
+	ip   net.IP
+	mark util.EgressIPMark
+}
+
 type BridgeEIPAddrManager struct {
 	nodeName         string
 	bridgeName       string
 	nodeAnnotationMu sync.Mutex
 	annotationIPs    sets.Set[string]
+	assignmentsMu    sync.Mutex
+	assignments      map[string]eipAssignment
 	eIPLister        egressiplisters.EgressIPLister
 	eIPInformer      cache.SharedIndexInformer
 	nodeLister       corev1listers.NodeLister
@@ -200,6 +208,7 @@ func NewBridgeEIPAddrManager(nodeName, bridgeName string, linkManager *linkmanag
 		bridgeName:       bridgeName,   // bridge name for which EIP IPs are managed
 		nodeAnnotationMu: sync.Mutex{}, // mu for updating Node annotation
 		annotationIPs:    sets.New[string](),
+		assignments:      make(map[string]eipAssignment),
 		eIPLister:        eIPInformer.Lister(),
 		eIPInformer:      eIPInformer.Informer(),
 		nodeLister:       nodeInformer.Lister(),
@@ -229,6 +238,9 @@ func (g *BridgeEIPAddrManager) AddEgressIP(eip *egressipv1.EgressIP) (bool, erro
 	if err = g.addIPBridge(ip); err != nil {
 		return false, fmt.Errorf("failed to add EgressIP gateway config because failed to add address to link: %v", err)
 	}
+	g.assignmentsMu.Lock()
+	g.assignments[eip.Name] = eipAssignment{ip: ip, mark: pktMark}
+	g.assignmentsMu.Unlock()
 	return true, nil
 }
 
@@ -251,7 +263,7 @@ func (g *BridgeEIPAddrManager) UpdateEgressIP(oldEIP, newEIP *egressipv1.EgressI
 	}
 
 	// Both exist and are the same - no change
-	if !oldSkip && !newSkip && oldIP.Equal(newIP) {
+	if !oldSkip && !newSkip && oldIP.Equal(newIP) && oldMark == newMark {
 		return false, nil
 	}
 
@@ -292,10 +304,70 @@ func (g *BridgeEIPAddrManager) UpdateEgressIP(oldEIP, newEIP *egressipv1.EgressI
 		isUpdated = true
 	}
 
+	g.assignmentsMu.Lock()
+	if newSkip {
+		delete(g.assignments, oldEIP.Name)
+	} else {
+		g.assignments[newEIP.Name] = eipAssignment{ip: newIP, mark: newMark}
+	}
+	g.assignmentsMu.Unlock()
+
 	return isUpdated, nil
 }
 
+func (g *BridgeEIPAddrManager) EnsureEgressIP(eip *egressipv1.EgressIP) (bool, error) {
+	if eip == nil {
+		return false, nil
+	}
+	ip, pktMark, shouldSkip, err := g.parseAndValidateEIP(eip)
+	if err != nil {
+		return false, fmt.Errorf("failed to validate egress IP %s: %w", eip.Name, err)
+	}
+
+	g.assignmentsMu.Lock()
+	oldAssign, hadOld := g.assignments[eip.Name]
+	g.assignmentsMu.Unlock()
+
+	if hadOld {
+		if shouldSkip {
+			return g.DeleteEgressIPByName(eip.Name)
+		}
+		if oldAssign.ip.Equal(ip) && oldAssign.mark == pktMark {
+			return false, nil
+		}
+		oldEIP := &egressipv1.EgressIP{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: eip.Name,
+				Annotations: map[string]string{
+					util.EgressIPMarkAnnotation: oldAssign.mark.String(),
+				},
+			},
+			Status: egressipv1.EgressIPStatus{
+				Items: []egressipv1.EgressIPStatusItem{
+					{Node: g.nodeName, EgressIP: oldAssign.ip.String()},
+				},
+			},
+		}
+		return g.UpdateEgressIP(oldEIP, eip)
+	}
+
+	if shouldSkip {
+		return false, nil
+	}
+	return g.AddEgressIP(eip)
+}
+
 func (g *BridgeEIPAddrManager) DeleteEgressIP(eip *egressipv1.EgressIP) (bool, error) {
+	if eip == nil {
+		return false, nil
+	}
+	g.assignmentsMu.Lock()
+	_, exists := g.assignments[eip.Name]
+	g.assignmentsMu.Unlock()
+	if exists {
+		return g.DeleteEgressIPByName(eip.Name)
+	}
+
 	ip, pktMark, shouldSkip, err := g.parseAndValidateEIP(eip)
 	if err != nil {
 		return false, fmt.Errorf("failed to delete EgressIP gateway config because unable to parse and validate EgressIP: %v", err)
@@ -314,6 +386,29 @@ func (g *BridgeEIPAddrManager) DeleteEgressIP(eip *egressipv1.EgressIP) (bool, e
 	return true, nil
 }
 
+func (g *BridgeEIPAddrManager) DeleteEgressIPByName(name string) (bool, error) {
+	g.assignmentsMu.Lock()
+	assign, exists := g.assignments[name]
+	g.assignmentsMu.Unlock()
+
+	if !exists {
+		return false, nil
+	}
+
+	if err := g.deleteIPBridge(assign.ip); err != nil {
+		return false, fmt.Errorf("failed to delete EgressIP gateway config because failed to delete address from link: %v", err)
+	}
+	g.cache.deleteMarkIP(assign.mark, assign.ip)
+	if err := g.deleteIPsFromAnnotation(assign.ip); err != nil {
+		return false, fmt.Errorf("failed to delete EgressIP gateway config because failed to delete EgressIP IP from Node annotation: %v", err)
+	}
+
+	g.assignmentsMu.Lock()
+	delete(g.assignments, name)
+	g.assignmentsMu.Unlock()
+	return true, nil
+}
+
 func (g *BridgeEIPAddrManager) SyncEgressIP(objs []interface{}) error {
 	// caller must synchronise
 	annotIPs, err := g.getAnnotationIPs()
@@ -325,6 +420,7 @@ func (g *BridgeEIPAddrManager) SyncEgressIP(objs []interface{}) error {
 	g.nodeAnnotationMu.Unlock()
 	configs := markIPs{v4: map[int]string{}, v6: map[int]string{}}
 	ipsToAdd := make([]net.IP, 0)
+	newAssignments := make(map[string]eipAssignment)
 	for _, obj := range objs {
 		eip, ok := obj.(*egressipv1.EgressIP)
 		if !ok {
@@ -339,6 +435,7 @@ func (g *BridgeEIPAddrManager) SyncEgressIP(objs []interface{}) error {
 			// Skip IPs not on OVN network (i.e., secondary network IPs)
 			continue
 		}
+		newAssignments[eip.Name] = eipAssignment{ip: ip, mark: pktMark}
 		configs.insert(pktMark, ip)
 		if err = g.addIPBridge(ip); err != nil {
 			return fmt.Errorf("failed to sync EgressIP gateway config because failed to add address to link: %v", err)
@@ -360,6 +457,9 @@ func (g *BridgeEIPAddrManager) SyncEgressIP(objs []interface{}) error {
 			return fmt.Errorf("failed to update EgressIP IPs in Node annotation: %v", err)
 		}
 	}
+	g.assignmentsMu.Lock()
+	g.assignments = newAssignments
+	g.assignmentsMu.Unlock()
 	g.cache.replaceAll(configs)
 	g.cache.setSyncdOnce()
 	return nil

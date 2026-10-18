@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ktypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -68,6 +69,20 @@ func (l *loadBalancerHealthChecker) AddService(svc *corev1.Service) error {
 }
 
 func (l *loadBalancerHealthChecker) UpdateService(old, new *corev1.Service) error {
+	name := ktypes.NamespacedName{Namespace: new.Namespace, Name: new.Name}
+	if old == nil {
+		l.Lock()
+		_, exists := l.services[name]
+		l.Unlock()
+		if !exists {
+			return l.AddService(new)
+		}
+		if new.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeCluster || new.Spec.HealthCheckNodePort == 0 {
+			return l.DeleteService(new)
+		}
+		return l.AddService(new)
+	}
+
 	// if the ETP values have changed between local and cluster,
 	// we need to update health checks accordingly
 	// HealthCheckNodePort is used only in ETP=local mode
@@ -78,26 +93,37 @@ func (l *loadBalancerHealthChecker) UpdateService(old, new *corev1.Service) erro
 		if err = l.AddService(new); err != nil {
 			errors = append(errors, err)
 		}
-	}
-	if old.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal &&
+	} else if old.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal &&
 		new.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeCluster {
 		if err = l.DeleteService(old); err != nil {
 			errors = append(errors, err)
+		}
+	} else if new.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal &&
+		old.Spec.HealthCheckNodePort != new.Spec.HealthCheckNodePort {
+		if new.Spec.HealthCheckNodePort == 0 {
+			if err = l.DeleteService(old); err != nil {
+				errors = append(errors, err)
+			}
+		} else {
+			if err = l.AddService(new); err != nil {
+				errors = append(errors, err)
+			}
 		}
 	}
 	return utilerrors.Join(errors...)
 }
 
 func (l *loadBalancerHealthChecker) DeleteService(svc *corev1.Service) error {
-	if svc.Spec.HealthCheckNodePort != 0 {
-		l.Lock()
-		defer l.Unlock()
-		name := ktypes.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
-		delete(l.services, name)
-		delete(l.endpoints, name)
-		return l.server.SyncServices(l.services)
+	l.Lock()
+	defer l.Unlock()
+	name := ktypes.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+	_, exists := l.services[name]
+	if !exists && svc.Spec.HealthCheckNodePort == 0 {
+		return nil
 	}
-	return nil
+	delete(l.services, name)
+	delete(l.endpoints, name)
+	return l.server.SyncServices(l.services)
 }
 
 func (l *loadBalancerHealthChecker) SyncServices(_ []interface{}) error {
@@ -119,6 +145,32 @@ func (l *loadBalancerHealthChecker) SyncEndPointSlices(epSlice *discovery.Endpoi
 	if len(epSlices) == 0 {
 		// let's delete it from cache and wait for the next update;
 		// this will show as 0 endpoints for health checks
+		delete(l.endpoints, namespacedName)
+	} else {
+		l.endpoints[namespacedName] = localEndpointAddressCount
+	}
+	return l.server.SyncEndpoints(l.endpoints)
+}
+
+func (l *loadBalancerHealthChecker) SyncEndpointSlicesForService(svc *corev1.Service) error {
+	namespacedName := ktypes.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+	l.Lock()
+	_, exists := l.services[namespacedName]
+	l.Unlock()
+	if !exists {
+		return nil
+	}
+	epSlices, err := l.watchFactory.GetServiceEndpointSlices(svc.Namespace, svc.Name, types.DefaultNetworkName)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("could not fetch endpointslices for service %s during health check: %v", namespacedName.String(), err)
+		}
+		epSlices = nil
+	}
+	localEndpointAddressCount := l.CountLocalReadyEndpointAddresses(epSlices)
+	l.Lock()
+	defer l.Unlock()
+	if len(epSlices) == 0 {
 		delete(l.endpoints, namespacedName)
 	} else {
 		l.endpoints[namespacedName] = localEndpointAddressCount

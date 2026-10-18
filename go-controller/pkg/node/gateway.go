@@ -4,8 +4,10 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"sync"
 	"time"
 
@@ -13,18 +15,23 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
 	libovsdbclient "github.com/ovn-kubernetes/libovsdb/client"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/informer"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/bridgeconfig"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/egressip"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 	utilerrors "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util/errors"
@@ -45,6 +52,7 @@ type Gateway interface {
 	SetDefaultPodNetworkAdvertised(bool)
 	SetDefaultBridgeGARPDropFlows(bool)
 	Reconcile() error
+	Stop()
 }
 
 type gateway struct {
@@ -62,9 +70,18 @@ type gateway struct {
 	initFunc             func() error
 	readyFunc            func() (bool, error)
 
-	servicesRetryFramework *retry.RetryFramework
+	serviceQueue   workqueue.TypedRateLimitingInterface[string]
+	serviceHandler cache.ResourceEventHandlerRegistration
+	serviceResync  sync.Map // map[string]struct{}
 
-	watchFactory *factory.WatchFactory // used for retry
+	endpointSliceQueue   workqueue.TypedRateLimitingInterface[string]
+	endpointSliceHandler cache.ResourceEventHandlerRegistration
+
+	egressIPQueue   workqueue.TypedRateLimitingInterface[string]
+	egressIPHandler cache.ResourceEventHandlerRegistration
+
+	stopOnce     sync.Once
+	watchFactory *factory.WatchFactory
 	stopChan     <-chan struct{}
 	wg           *sync.WaitGroup
 
@@ -299,6 +316,38 @@ func (g *gateway) DeleteEgressIP(eip *egressipv1.EgressIP) error {
 	return nil
 }
 
+func (g *gateway) DeleteEgressIPByName(name string) error {
+	if !canHandleBridgeEgressIP() {
+		return nil
+	}
+	isSyncRequired, err := g.bridgeEIPAddrManager.DeleteEgressIPByName(name)
+	if err != nil {
+		return err
+	}
+	if isSyncRequired {
+		if err = g.Reconcile(); err != nil {
+			return fmt.Errorf("failed to sync gateway: %v", err)
+		}
+	}
+	return nil
+}
+
+func (g *gateway) EnsureEgressIP(eip *egressipv1.EgressIP) error {
+	if !canHandleBridgeEgressIP() {
+		return nil
+	}
+	isSyncRequired, err := g.bridgeEIPAddrManager.EnsureEgressIP(eip)
+	if err != nil {
+		return err
+	}
+	if isSyncRequired {
+		if err = g.Reconcile(); err != nil {
+			return fmt.Errorf("failed to sync gateway: %v", err)
+		}
+	}
+	return nil
+}
+
 func (g *gateway) SyncEgressIP(eips []interface{}) error {
 	if !canHandleBridgeEgressIP() {
 		return nil
@@ -312,26 +361,551 @@ func (g *gateway) SyncEgressIP(eips []interface{}) error {
 	return nil
 }
 
+func (g *gateway) onServiceAdd(obj interface{}) {
+	svc, ok := obj.(*corev1.Service)
+	if !ok {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(svc)
+	if err != nil {
+		return
+	}
+	g.serviceQueue.Add(key)
+}
+
+func (g *gateway) onServiceUpdate(oldObj, newObj interface{}) {
+	oldSvc, ok1 := oldObj.(*corev1.Service)
+	newSvc, ok2 := newObj.(*corev1.Service)
+	if !ok1 || !ok2 {
+		return
+	}
+	if serviceUpdateNotNeeded(oldSvc, newSvc) {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(newSvc)
+	if err != nil {
+		return
+	}
+	g.serviceQueue.Add(key)
+}
+
+func (g *gateway) onServiceDelete(obj interface{}) {
+	svc, ok := obj.(*corev1.Service)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		svc, ok = tombstone.Obj.(*corev1.Service)
+		if !ok {
+			return
+		}
+	}
+	key, err := cache.MetaNamespaceKeyFunc(svc)
+	if err != nil {
+		return
+	}
+	g.serviceQueue.Add(key)
+}
+
+func (g *gateway) runServiceWorker(ctx context.Context) {
+	for g.processServiceItem() {
+	}
+}
+
+func (g *gateway) processServiceItem() bool {
+	key, shutdown := g.serviceQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer g.serviceQueue.Done(key)
+
+	err := g.reconcileService(key)
+	if err != nil {
+		if g.serviceQueue.NumRequeues(key) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling service %s: %v, requeuing", key, err)
+			g.serviceQueue.AddRateLimited(key)
+			return true
+		}
+		klog.Errorf("Dropping service %s out of gateway queue after %d attempts: %v", key, controller.DefaultMaxAttempts, err)
+		g.serviceResync.Delete(key)
+	}
+	g.serviceQueue.Forget(key)
+	return true
+}
+
+func (g *gateway) reconcileService(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	curSvc, err := g.watchFactory.GetService(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			g.serviceResync.Delete(key)
+			dummySvc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      name,
+				},
+			}
+			return g.DeleteService(dummySvc)
+		}
+		return fmt.Errorf("failed to get service %s: %w", key, err)
+	}
+
+	_, forceAdd := g.serviceResync.LoadAndDelete(key)
+	if forceAdd {
+		err = g.AddService(curSvc)
+	} else {
+		err = g.UpdateService(nil, curSvc)
+	}
+	if err != nil {
+		if forceAdd {
+			g.serviceResync.Store(key, struct{}{})
+		}
+		return err
+	}
+	return nil
+}
+
+func endpointSliceUpdateNotNeeded(oldEPS, newEPS *discovery.EndpointSlice) bool {
+	return reflect.DeepEqual(oldEPS.Endpoints, newEPS.Endpoints) &&
+		reflect.DeepEqual(oldEPS.Ports, newEPS.Ports) &&
+		reflect.DeepEqual(oldEPS.Labels, newEPS.Labels) &&
+		reflect.DeepEqual(oldEPS.Annotations, newEPS.Annotations)
+}
+
+func egressIPUpdateNotNeeded(oldEIP, newEIP *egressipv1.EgressIP) bool {
+	return reflect.DeepEqual(oldEIP.Status.Items, newEIP.Status.Items) &&
+		reflect.DeepEqual(oldEIP.Spec.EgressIPs, newEIP.Spec.EgressIPs) &&
+		!util.EgressIPMarkAnnotationChanged(oldEIP.Annotations, newEIP.Annotations)
+}
+
+func (g *gateway) onEndpointSliceAdd(obj interface{}) {
+	eps, ok := obj.(*discovery.EndpointSlice)
+	if !ok {
+		return
+	}
+	g.enqueueEndpointSliceService(eps)
+}
+
+func (g *gateway) onEndpointSliceUpdate(oldObj, newObj interface{}) {
+	oldEPS, ok1 := oldObj.(*discovery.EndpointSlice)
+	newEPS, ok2 := newObj.(*discovery.EndpointSlice)
+	if !ok1 || !ok2 {
+		return
+	}
+	if endpointSliceUpdateNotNeeded(oldEPS, newEPS) {
+		return
+	}
+	oldSvc := getServiceNameFromEndpointSlice(oldEPS)
+	newSvc := getServiceNameFromEndpointSlice(newEPS)
+	if oldSvc != "" && oldSvc != newSvc {
+		g.endpointSliceQueue.Add(oldEPS.Namespace + "/" + oldSvc)
+	}
+	g.enqueueEndpointSliceService(newEPS)
+}
+
+func (g *gateway) onEndpointSliceDelete(obj interface{}) {
+	eps, ok := obj.(*discovery.EndpointSlice)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		eps, ok = tombstone.Obj.(*discovery.EndpointSlice)
+		if !ok {
+			return
+		}
+	}
+	g.enqueueEndpointSliceService(eps)
+}
+
+func (g *gateway) enqueueEndpointSliceService(eps *discovery.EndpointSlice) {
+	svcName := getServiceNameFromEndpointSlice(eps)
+	if svcName == "" {
+		return
+	}
+	g.endpointSliceQueue.Add(eps.Namespace + "/" + svcName)
+}
+
+func getServiceNameFromEndpointSlice(eps *discovery.EndpointSlice) string {
+	if svcName, ok := eps.Labels[discovery.LabelServiceName]; ok && svcName != "" {
+		return svcName
+	}
+	if svcName, ok := eps.Labels[types.LabelUserDefinedServiceName]; ok && svcName != "" {
+		return svcName
+	}
+	return ""
+}
+
+func (g *gateway) runEndpointSliceWorker(_ context.Context) {
+	for g.processEndpointSliceItem() {
+	}
+}
+
+func (g *gateway) processEndpointSliceItem() bool {
+	key, shutdown := g.endpointSliceQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer g.endpointSliceQueue.Done(key)
+
+	err := g.reconcileEndpointSlice(key)
+	if err != nil {
+		if g.endpointSliceQueue.NumRequeues(key) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling endpoint slice %s: %v, requeuing", key, err)
+			g.endpointSliceQueue.AddRateLimited(key)
+			return true
+		}
+		klog.Errorf("Dropping endpoint slice %s out of gateway queue after %d attempts: %v", key, controller.DefaultMaxAttempts, err)
+	}
+	g.endpointSliceQueue.Forget(key)
+	return true
+}
+
+func (g *gateway) reconcileEndpointSlice(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	curSvc, err := g.watchFactory.GetService(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get service %s: %w", key, err)
+	}
+
+	return g.SyncEndpointSlicesForService(curSvc)
+}
+
+type serviceEndpointSliceSyncer interface {
+	SyncEndpointSlicesForService(*corev1.Service) error
+}
+
+func (g *gateway) SyncEndpointSlicesForService(svc *corev1.Service) error {
+	var errors []error
+	if syncable, ok := g.loadBalancerHealthChecker.(serviceEndpointSliceSyncer); ok {
+		if err := syncable.SyncEndpointSlicesForService(svc); err != nil {
+			errors = append(errors, err)
+		}
+	} else if g.loadBalancerHealthChecker != nil {
+		dummyEPS := &discovery.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: svc.Namespace,
+				Name:      svc.Name,
+				Labels: map[string]string{
+					discovery.LabelServiceName: svc.Name,
+				},
+			},
+		}
+		if err := g.loadBalancerHealthChecker.AddEndpointSlice(dummyEPS); err != nil {
+			errors = append(errors, err)
+		}
+	}
+
+	if syncable, ok := g.nodePortWatcher.(serviceEndpointSliceSyncer); ok {
+		if err := syncable.SyncEndpointSlicesForService(svc); err != nil {
+			errors = append(errors, err)
+		}
+	} else if g.nodePortWatcher != nil {
+		dummyEPS := &discovery.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: svc.Namespace,
+				Name:      svc.Name,
+				Labels: map[string]string{
+					discovery.LabelServiceName: svc.Name,
+				},
+			},
+		}
+		if err := g.nodePortWatcher.AddEndpointSlice(dummyEPS); err != nil {
+			errors = append(errors, err)
+		}
+	}
+	return utilerrors.Join(errors...)
+}
+
+func (g *gateway) onEgressIPAdd(obj interface{}) {
+	eip, ok := obj.(*egressipv1.EgressIP)
+	if !ok {
+		return
+	}
+	g.egressIPQueue.Add(eip.Name)
+}
+
+func (g *gateway) onEgressIPUpdate(oldObj, newObj interface{}) {
+	oldEIP, ok1 := oldObj.(*egressipv1.EgressIP)
+	newEIP, ok2 := newObj.(*egressipv1.EgressIP)
+	if !ok1 || !ok2 {
+		return
+	}
+	if egressIPUpdateNotNeeded(oldEIP, newEIP) {
+		return
+	}
+	g.egressIPQueue.Add(newEIP.Name)
+}
+
+func (g *gateway) onEgressIPDelete(obj interface{}) {
+	eip, ok := obj.(*egressipv1.EgressIP)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		eip, ok = tombstone.Obj.(*egressipv1.EgressIP)
+		if !ok {
+			return
+		}
+	}
+	g.egressIPQueue.Add(eip.Name)
+}
+
+func (g *gateway) runEgressIPWorker(_ context.Context) {
+	for g.processEgressIPItem() {
+	}
+}
+
+func (g *gateway) processEgressIPItem() bool {
+	name, shutdown := g.egressIPQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer g.egressIPQueue.Done(name)
+
+	err := g.reconcileEgressIP(name)
+	if err != nil {
+		if g.egressIPQueue.NumRequeues(name) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling egress IP %s: %v, requeuing", name, err)
+			g.egressIPQueue.AddRateLimited(name)
+			return true
+		}
+		klog.Errorf("Dropping egress IP %s out of gateway queue after %d attempts: %v", name, controller.DefaultMaxAttempts, err)
+	}
+	g.egressIPQueue.Forget(name)
+	return true
+}
+
+func (g *gateway) reconcileEgressIP(name string) error {
+	curEIP, err := g.watchFactory.GetEgressIP(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return g.DeleteEgressIPByName(name)
+		}
+		return fmt.Errorf("failed to get egress IP %s: %w", name, err)
+	}
+
+	return g.EnsureEgressIP(curEIP)
+}
+
+func (g *gateway) Stop() {
+	g.stopOnce.Do(g.stop)
+}
+
+func (g *gateway) stop() {
+	if g.serviceQueue != nil {
+		g.serviceQueue.ShutDown()
+	}
+	if g.endpointSliceQueue != nil {
+		g.endpointSliceQueue.ShutDown()
+	}
+	if g.egressIPQueue != nil {
+		g.egressIPQueue.ShutDown()
+	}
+	if g.serviceHandler != nil {
+		if err := g.watchFactory.ServiceInformer().RemoveEventHandler(g.serviceHandler); err != nil {
+			klog.Warningf("Failed to remove gateway Service event handler: %v", err)
+		}
+		g.serviceHandler = nil
+	}
+	if g.endpointSliceHandler != nil {
+		if err := g.watchFactory.EndpointSliceInformer().RemoveEventHandler(g.endpointSliceHandler); err != nil {
+			klog.Warningf("Failed to remove gateway EndpointSlice event handler: %v", err)
+		}
+		g.endpointSliceHandler = nil
+	}
+	if g.egressIPHandler != nil {
+		if err := g.watchFactory.EgressIPInformer().Informer().RemoveEventHandler(g.egressIPHandler); err != nil {
+			klog.Warningf("Failed to remove gateway EgressIP event handler: %v", err)
+		}
+		g.egressIPHandler = nil
+	}
+}
+
+func (g *gateway) initHandlers() error {
+	if g.watchFactory == nil {
+		return nil
+	}
+
+	g.serviceQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "gateway-services"},
+	)
+	g.endpointSliceQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "gateway-endpointslices"},
+	)
+
+	var err error
+	g.serviceHandler, err = g.watchFactory.ServiceInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    g.onServiceAdd,
+			UpdateFunc: g.onServiceUpdate,
+			DeleteFunc: g.onServiceDelete,
+		}),
+	)
+	if err != nil {
+		g.Stop()
+		return fmt.Errorf("failed to add Service event handler: %w", err)
+	}
+
+	g.endpointSliceHandler, err = g.watchFactory.EndpointSliceInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    g.onEndpointSliceAdd,
+			UpdateFunc: g.onEndpointSliceUpdate,
+			DeleteFunc: g.onEndpointSliceDelete,
+		}),
+	)
+	if err != nil {
+		g.Stop()
+		return fmt.Errorf("failed to add EndpointSlice event handler: %w", err)
+	}
+
+	if config.OVNKubernetesFeature.EnableEgressIP {
+		g.egressIPQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+			controller.DefaultRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "gateway-egressips"},
+		)
+		g.egressIPHandler, err = g.watchFactory.EgressIPInformer().Informer().AddEventHandler(
+			factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+				AddFunc:    g.onEgressIPAdd,
+				UpdateFunc: g.onEgressIPUpdate,
+				DeleteFunc: g.onEgressIPDelete,
+			}),
+		)
+		if err != nil {
+			g.Stop()
+			return fmt.Errorf("failed to add EgressIP event handler: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// syncServicesOnStartup synchronizes existing services in batch during gateway Init.
+func (g *gateway) syncServicesOnStartup(ctx context.Context) error {
+	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 60*time.Second, true, func(_ context.Context) (bool, error) {
+		svcs, err := g.watchFactory.GetServices()
+		if err != nil {
+			klog.Errorf("Failed (will retry) to get services for initial sync: %v", err)
+			return false, nil
+		}
+		svcObjs := make([]interface{}, len(svcs))
+		for i, svc := range svcs {
+			svcObjs[i] = svc
+		}
+		if err := g.SyncServices(svcObjs); err != nil {
+			klog.Errorf("Failed (will retry) while syncing gateway services: %v", err)
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed initial service sync: %w", err)
+	}
+	return nil
+}
+
+func (g *gateway) syncEgressIPOnStartup(ctx context.Context) error {
+	var eips []*egressipv1.EgressIP
+	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 60*time.Second, true, func(_ context.Context) (bool, error) {
+		var err error
+		eips, err = g.watchFactory.GetEgressIPs()
+		if err != nil {
+			klog.Errorf("Failed (will retry) to get egress IPs for initial sync: %v", err)
+			return false, nil
+		}
+		eipObjs := make([]interface{}, len(eips))
+		for i, eip := range eips {
+			eipObjs[i] = eip
+		}
+		if err := g.SyncEgressIP(eipObjs); err != nil {
+			klog.Errorf("Failed (will retry) while syncing gateway egress IPs: %v", err)
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed initial egress IP sync: %w", err)
+	}
+
+	return nil
+}
+
+func (g *gateway) WatchServices(ctx context.Context, workers int) error {
+	if g.serviceQueue == nil {
+		return fmt.Errorf("serviceQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			wait.UntilWithContext(ctx, g.runServiceWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (g *gateway) WatchEndpointSlices(ctx context.Context, workers int) error {
+	if g.endpointSliceQueue == nil {
+		return fmt.Errorf("endpointSliceQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			wait.UntilWithContext(ctx, g.runEndpointSliceWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (g *gateway) WatchEgressIPs(ctx context.Context, workers int) error {
+	if g.egressIPQueue == nil {
+		return fmt.Errorf("egressIPQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			wait.UntilWithContext(ctx, g.runEgressIPWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
 func (g *gateway) Init(stopChan <-chan struct{}, wg *sync.WaitGroup) error {
 	g.stopChan = stopChan
 	g.wg = wg
 
-	var err error
-
-	g.servicesRetryFramework = g.newRetryFrameworkNode(factory.ServiceForGatewayType)
-	if _, err = g.servicesRetryFramework.WatchResource(); err != nil {
-		return fmt.Errorf("gateway init failed to start watching services: %v", err)
-	}
-
-	endpointSlicesRetryFramework := g.newRetryFrameworkNode(factory.EndpointSliceForGatewayType)
-	if _, err = endpointSlicesRetryFramework.WatchResource(); err != nil {
-		return fmt.Errorf("gateway init failed to start watching endpointslices: %v", err)
-	}
-
-	if config.OVNKubernetesFeature.EnableEgressIP {
-		eipRetryFramework := g.newRetryFrameworkNode(factory.EgressIPType)
-		if _, err = eipRetryFramework.WatchResource(); err != nil {
-			return fmt.Errorf("gateway init failed to start watching EgressIPs: %v", err)
+	if g.watchFactory != nil && g.serviceQueue != nil {
+		initCtx := wait.ContextForChannel(stopChan)
+		if err := g.syncServicesOnStartup(initCtx); err != nil {
+			return err
+		}
+		if config.OVNKubernetesFeature.EnableEgressIP && g.egressIPQueue != nil {
+			if err := g.syncEgressIPOnStartup(initCtx); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -350,6 +924,21 @@ func (g *gateway) Start() error {
 
 	if g.nodeIPManager != nil {
 		g.nodeIPManager.Run(g.stopChan, g.wg)
+	}
+
+	if g.watchFactory != nil && g.serviceQueue != nil {
+		runCtx := wait.ContextForChannel(g.stopChan)
+		if err := g.WatchServices(runCtx, 1); err != nil {
+			return fmt.Errorf("failed to watch services: %w", err)
+		}
+		if err := g.WatchEndpointSlices(runCtx, 1); err != nil {
+			return fmt.Errorf("failed to watch endpoint slices: %w", err)
+		}
+		if config.OVNKubernetesFeature.EnableEgressIP && g.egressIPQueue != nil {
+			if err := g.WatchEgressIPs(runCtx, 1); err != nil {
+				return fmt.Errorf("failed to watch egress IPs: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -565,7 +1154,7 @@ func (g *gateway) ReconcileNetworkRemoval() error {
 }
 
 // reconcile refreshes the gateway's OpenFlow/SNAT state and, if syncServices is
-// non-nil, resyncs the selected services through the retry framework.
+// non-nil, resyncs the selected services through the gateway workqueue.
 func (g *gateway) reconcile(syncServices func() []error) error {
 	klog.Info("Reconciling gateway with updates")
 	if config.IsModeDPU() || config.IsModeFull() {
@@ -590,7 +1179,7 @@ func (g *gateway) reconcile(syncServices func() []error) error {
 		}
 	}
 	// Services create OpenFlow flows as well, need to resync the affected ones.
-	if g.servicesRetryFramework != nil && syncServices != nil {
+	if g.serviceQueue != nil && syncServices != nil {
 		if errs := syncServices(); errs != nil {
 			return utilerrors.Join(errs...)
 		}
@@ -610,7 +1199,7 @@ func (g *gateway) resyncAllServices() []error {
 
 // resyncNetworkServices enqueues only the services in netInfo's namespaces
 // (GetNADNamespaces) for reprogramming, instead of scanning every service. A selected
-// namespace whose NAD has not landed yet recovers via its own per-service retry.
+// namespace whose NAD has not landed yet recovers via its own per-service workqueue retry.
 func (g *gateway) resyncNetworkServices(netInfo util.NetInfo) []error {
 	var svcs []*corev1.Service
 	for _, namespace := range netInfo.GetNADNamespaces() {
@@ -623,18 +1212,22 @@ func (g *gateway) resyncNetworkServices(netInfo util.NetInfo) []error {
 	return g.resyncServices(svcs)
 }
 
-// resyncServices adds the given services to the retry framework with no backoff and
-// requests an immediate retry.
+// resyncServices adds the given services to the workqueue.
 func (g *gateway) resyncServices(svcs []*corev1.Service) []error {
+	if g.serviceQueue == nil {
+		return nil
+	}
 	var errs []error
 	for _, svc := range svcs {
-		svc := *svc
-		klog.V(5).Infof("Adding service %s/%s to retryServices", svc.Namespace, svc.Name)
-		if err := g.servicesRetryFramework.AddRetryObjWithAddNoBackoff(&svc); err != nil {
-			errs = append(errs, fmt.Errorf("failed to add service %s/%s to retry framework: %w", svc.Namespace, svc.Name, err))
+		key, err := cache.MetaNamespaceKeyFunc(svc)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to get key for service %s/%s: %w", svc.Namespace, svc.Name, err))
+			continue
 		}
+		klog.V(5).Infof("Adding service %s to serviceQueue", key)
+		g.serviceResync.Store(key, struct{}{})
+		g.serviceQueue.Add(key)
 	}
-	g.servicesRetryFramework.RequestRetryObjs()
 	return errs
 }
 

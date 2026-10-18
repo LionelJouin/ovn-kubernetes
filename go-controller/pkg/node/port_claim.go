@@ -130,7 +130,9 @@ func (p *localPortManager) emitPortClaimEvent(svc *corev1.Service, port int32, e
 }
 
 type portClaimWatcher struct {
-	port portManager
+	port             portManager
+	servicePortsLock sync.Mutex
+	servicePorts     map[types.NamespacedName]*corev1.Service
 }
 
 func newPortClaimWatcher(recorder record.EventRecorder) (*portClaimWatcher, error) {
@@ -146,42 +148,90 @@ func newPortClaimWatcher(recorder record.EventRecorder) (*portClaimWatcher, erro
 			localAddrSet:      localAddrSet,
 			portOpener:        &utilnet.ListenPortOpener,
 		},
+		servicePorts: make(map[types.NamespacedName]*corev1.Service),
 	}, nil
 }
 
 func (p *portClaimWatcher) AddService(svc *corev1.Service) error {
 	var errors []error
-	if raw_errors := handleService(svc, p.port.open); len(errors) > 0 {
-		for _, err := range raw_errors {
+	if rawErrors := handleService(svc, p.port.open); len(rawErrors) > 0 {
+		for _, err := range rawErrors {
 			errors = append(errors, fmt.Errorf("error claiming port for service: %s/%s: %v", svc.Namespace, svc.Name, err))
-		}
-	}
-	return utilerrors.Join(errors...)
-}
-
-func (p *portClaimWatcher) UpdateService(old, new *corev1.Service) error {
-	if reflect.DeepEqual(old.Spec.ExternalIPs, new.Spec.ExternalIPs) && reflect.DeepEqual(old.Spec.Ports, new.Spec.Ports) {
-		return nil
-	}
-	var errors, raw_errors []error
-	raw_errors = append(raw_errors, handleService(old, p.port.close)...)
-	raw_errors = append(raw_errors, handleService(new, p.port.open)...)
-	if len(raw_errors) > 0 {
-		for _, err := range raw_errors {
-			errors = append(errors, fmt.Errorf("error updating port claim for service: %s/%s: %v", old.Namespace, old.Name, err))
-		}
-	}
-	return utilerrors.Join(errors...)
-}
-
-func (p *portClaimWatcher) DeleteService(svc *corev1.Service) error {
-	var errors []error
-	if raw_errors := handleService(svc, p.port.close); len(raw_errors) > 0 {
-		for _, err := range raw_errors {
-			errors = append(errors, fmt.Errorf("error removing port claim for service: %s/%s: %v", svc.Namespace, svc.Name, err))
 		}
 		return utilerrors.Join(errors...)
 	}
+
+	name := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+	p.servicePortsLock.Lock()
+	if p.servicePorts == nil {
+		p.servicePorts = make(map[types.NamespacedName]*corev1.Service)
+	}
+	p.servicePorts[name] = svc
+	p.servicePortsLock.Unlock()
+
+	return nil
+}
+
+func (p *portClaimWatcher) UpdateService(old, new *corev1.Service) error {
+	name := types.NamespacedName{Namespace: new.Namespace, Name: new.Name}
+	p.servicePortsLock.Lock()
+	if p.servicePorts == nil {
+		p.servicePorts = make(map[types.NamespacedName]*corev1.Service)
+	}
+	if old == nil {
+		old = p.servicePorts[name]
+	}
+	p.servicePortsLock.Unlock()
+
+	if old == nil {
+		return p.AddService(new)
+	}
+
+	if old.Spec.Type == new.Spec.Type &&
+		reflect.DeepEqual(old.Spec.ExternalIPs, new.Spec.ExternalIPs) &&
+		reflect.DeepEqual(old.Spec.Ports, new.Spec.Ports) {
+		return nil
+	}
+	var errors, rawErrors []error
+	rawErrors = append(rawErrors, handleService(old, p.port.close)...)
+	rawErrors = append(rawErrors, handleService(new, p.port.open)...)
+	if len(rawErrors) > 0 {
+		for _, err := range rawErrors {
+			errors = append(errors, fmt.Errorf("error updating port claim for service: %s/%s: %v", old.Namespace, old.Name, err))
+		}
+		return utilerrors.Join(errors...)
+	}
+
+	p.servicePortsLock.Lock()
+	p.servicePorts[name] = new
+	p.servicePortsLock.Unlock()
+
+	return nil
+}
+
+func (p *portClaimWatcher) DeleteService(svc *corev1.Service) error {
+	name := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+	p.servicePortsLock.Lock()
+	oldSvc, exists := p.servicePorts[name]
+	p.servicePortsLock.Unlock()
+
+	targetSvc := svc
+	if exists {
+		targetSvc = oldSvc
+	}
+
+	var errors []error
+	if rawErrors := handleService(targetSvc, p.port.close); len(rawErrors) > 0 {
+		for _, err := range rawErrors {
+			errors = append(errors, fmt.Errorf("error removing port claim for service: %s/%s: %v", targetSvc.Namespace, targetSvc.Name, err))
+		}
+		return utilerrors.Join(errors...)
+	}
+
+	p.servicePortsLock.Lock()
+	delete(p.servicePorts, name)
+	p.servicePortsLock.Unlock()
+
 	return nil
 }
 

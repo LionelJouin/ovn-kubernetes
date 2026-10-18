@@ -190,11 +190,14 @@ func configureUDNServicesNFTables() error {
 // to ensure that services using NodePorts are accessible.
 type nodePortWatcherNFTables struct {
 	networkManager networkmanager.Interface
+	serviceLock    sync.Mutex
+	services       map[ktypes.NamespacedName]*corev1.Service
 }
 
 func newNodePortWatcherNFTables(networkManager networkmanager.Interface) *nodePortWatcherNFTables {
 	return &nodePortWatcherNFTables{
 		networkManager: networkManager,
+		services:       make(map[ktypes.NamespacedName]*corev1.Service),
 	}
 }
 
@@ -753,6 +756,13 @@ func (npw *nodePortWatcher) getServiceInfo(index ktypes.NamespacedName) (out *se
 	return out, exists
 }
 
+// deleteServiceInfo deletes the serviceConfig for a service
+func (npw *nodePortWatcher) deleteServiceInfo(index ktypes.NamespacedName) {
+	npw.serviceInfoLock.Lock()
+	defer npw.serviceInfoLock.Unlock()
+	delete(npw.serviceInfo, index)
+}
+
 // getAndSetServiceInfo creates and sets the serviceConfig, returns if it existed and whatever was there
 func (npw *nodePortWatcher) getAndSetServiceInfo(index ktypes.NamespacedName, service *corev1.Service, hasLocalHostNetworkEp bool, localEndpoints util.PortToLBEndpoints) (old *serviceConfig, exists bool) {
 	npw.serviceInfoLock.Lock()
@@ -911,7 +921,8 @@ func serviceUpdateNotNeeded(old, new *corev1.Service) bool {
 		reflect.DeepEqual(new.Status.LoadBalancer.Ingress, old.Status.LoadBalancer.Ingress) &&
 		reflect.DeepEqual(new.Spec.ExternalTrafficPolicy, old.Spec.ExternalTrafficPolicy) &&
 		reflect.DeepEqual(new.Spec.InternalTrafficPolicy, old.Spec.InternalTrafficPolicy) &&
-		reflect.DeepEqual(new.Spec.AllocateLoadBalancerNodePorts, old.Spec.AllocateLoadBalancerNodePorts)
+		reflect.DeepEqual(new.Spec.AllocateLoadBalancerNodePorts, old.Spec.AllocateLoadBalancerNodePorts) &&
+		new.Spec.HealthCheckNodePort == old.Spec.HealthCheckNodePort
 }
 
 // AddService handles configuring shared gateway bridge flows to steer External IP, Node Port, Ingress LB traffic into OVN
@@ -971,23 +982,23 @@ func (npw *nodePortWatcher) AddService(service *corev1.Service) error {
 func (npw *nodePortWatcher) UpdateService(old, new *corev1.Service) error {
 	var err error
 	var errors []error
-	name := ktypes.NamespacedName{Namespace: old.Namespace, Name: old.Name}
+	name := ktypes.NamespacedName{Namespace: new.Namespace, Name: new.Name}
 
-	if serviceUpdateNotNeeded(old, new) {
+	svcConfig, exists := npw.getServiceInfo(name)
+	if !exists {
+		return npw.AddService(new)
+	}
+	if old == nil && svcConfig != nil {
+		old = svcConfig.service
+	}
+	if old != nil && serviceUpdateNotNeeded(old, new) {
 		klog.V(5).Infof("Skipping service update for: %s as change does not apply to any of .Spec.Ports, "+
 			".Spec.ExternalIP, .Spec.ClusterIP, .Spec.ClusterIPs, .Spec.Type, .Status.LoadBalancer.Ingress, "+
-			".Spec.ExternalTrafficPolicy, .Spec.InternalTrafficPolicy", new.Name)
-		return nil
-	}
-	// Update the service in svcConfig if we need to so that other handler
-	// threads do the correct thing, leave hasLocalHostNetworkEp and localEndpoints alone in the cache
-	svcConfig, exists := npw.updateServiceInfo(name, new, nil, nil)
-	if !exists {
-		klog.V(5).Infof("Service %s in namespace %s was deleted during service Update", old.Name, old.Namespace)
+			".Spec.ExternalTrafficPolicy, .Spec.InternalTrafficPolicy, .Spec.AllocateLoadBalancerNodePorts, .Spec.HealthCheckNodePort", new.Name)
 		return nil
 	}
 
-	if util.ServiceTypeHasClusterIP(old) && util.IsClusterIPSet(old) {
+	if old != nil && util.ServiceTypeHasClusterIP(old) && util.IsClusterIPSet(old) {
 		// Delete old rules if needed, but don't delete svcConfig
 		// so that we don't miss any endpoint update events here
 		klog.V(5).Infof("Deleting old service rules for: %v", old)
@@ -1026,6 +1037,7 @@ func (npw *nodePortWatcher) UpdateService(old, new *corev1.Service) error {
 	if err = utilerrors.Join(errors...); err != nil {
 		return fmt.Errorf("UpdateService failed for nodePortWatcher: %v", err)
 	}
+	npw.updateServiceInfo(name, new, nil, nil)
 	return nil
 
 }
@@ -1208,13 +1220,22 @@ func (npw *nodePortWatcher) deleteConntrackForService(service *corev1.Service) e
 func (npw *nodePortWatcher) DeleteService(service *corev1.Service) error {
 	var err error
 	var errors []error
+
+	name := ktypes.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+	svcConfig, exists := npw.getServiceInfo(name)
+	if exists {
+		service = svcConfig.service
+	}
+
 	if !util.ServiceTypeHasClusterIP(service) || !util.IsClusterIPSet(service) {
+		if exists {
+			npw.deleteServiceInfo(name)
+		}
 		return nil
 	}
 
 	klog.V(5).Infof("Deleting service %s in namespace %s", service.Name, service.Namespace)
-	name := ktypes.NamespacedName{Namespace: service.Namespace, Name: service.Name}
-	if svcConfig, exists := npw.getAndDeleteServiceInfo(name); exists {
+	if exists {
 		if err = delServiceRules(svcConfig.service, svcConfig.localEndpoints, npw); err != nil {
 			errors = append(errors, err)
 		}
@@ -1231,6 +1252,8 @@ func (npw *nodePortWatcher) DeleteService(service *corev1.Service) error {
 	if err = utilerrors.Join(errors...); err != nil {
 		return fmt.Errorf("DeleteService failed for nodePortWatcher: %v", err)
 	}
+
+	npw.deleteServiceInfo(name)
 	return nil
 
 }
@@ -1474,6 +1497,64 @@ func (npw *nodePortWatcher) DeleteEndpointSlice(epSlice *discovery.EndpointSlice
 	return nil
 }
 
+func (npw *nodePortWatcher) SyncEndpointSlicesForService(service *corev1.Service) error {
+	if !util.ServiceTypeHasClusterIP(service) || !util.IsClusterIPSet(service) {
+		return nil
+	}
+
+	netInfo, err := npw.networkManager.GetActiveNetworkForNamespace(service.Namespace)
+	if err != nil {
+		if util.IsInvalidPrimaryNetworkError(err) || apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("error getting active network for service %s in namespace %s: %w", service.Name, service.Namespace, err)
+	}
+	if netInfo == nil {
+		// network not active on our node
+		return nil
+	}
+
+	name := ktypes.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+	epSlices, err := npw.watchFactory.GetServiceEndpointSlices(service.Namespace, service.Name, netInfo.GetNetworkName())
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("error retrieving endpointslices for service %s/%s: %w", service.Namespace, service.Name, err)
+		}
+		epSlices = nil
+	}
+	nodeIPs, _ := npw.nodeIPManager.ListAddresses()
+	localEndpoints := npw.GetLocalEligibleEndpointAddresses(epSlices, service)
+	hasLocalHostNetworkEp := util.HasLocalHostNetworkEndpoints(localEndpoints, nodeIPs)
+
+	out, exists := npw.getServiceInfo(name)
+	if !exists {
+		if err = addServiceRules(service, netInfo, localEndpoints, hasLocalHostNetworkEp, npw); err != nil {
+			return err
+		}
+		npw.addOrSetServiceInfo(name, service, hasLocalHostNetworkEp, localEndpoints)
+		return nil
+	}
+
+	localEndpointsChanged := !reflect.DeepEqual(out.localEndpoints, localEndpoints)
+	hostNetEpChanged := out.hasLocalHostNetworkEp != hasLocalHostNetworkEp
+
+	if localEndpointsChanged || hostNetEpChanged {
+		var errors []error
+		if err = delServiceRules(out.service, out.localEndpoints, npw); err != nil {
+			errors = append(errors, err)
+		}
+		if err = addServiceRules(service, netInfo, localEndpoints, hasLocalHostNetworkEp, npw); err != nil {
+			errors = append(errors, err)
+		}
+		if err = utilerrors.Join(errors...); err != nil {
+			return err
+		}
+		npw.updateServiceInfo(name, service, &hasLocalHostNetworkEp, localEndpoints)
+	}
+
+	return nil
+}
+
 // GetLocalEligibleEndpointAddresses returns eligible endpoints that are local to the node.
 // This method uses util.GetEndpointsForService, the same as the services Controller via buildServiceLBConfigs,
 // meaning that the nodePortWatcher and the services Controller now use common logic to build their service endpoints.
@@ -1605,20 +1686,33 @@ func (npwnft *nodePortWatcherNFTables) AddService(service *corev1.Service) error
 	if err := addServiceRules(service, netInfo, nil, false, nil); err != nil {
 		return fmt.Errorf("AddService failed for nodePortWatcherNFTables: %v", err)
 	}
+
+	name := ktypes.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+	npwnft.serviceLock.Lock()
+	npwnft.services[name] = service
+	npwnft.serviceLock.Unlock()
+
 	return nil
 }
 
 func (npwnft *nodePortWatcherNFTables) UpdateService(old, new *corev1.Service) error {
 	var err error
 	var errors []error
-	if serviceUpdateNotNeeded(old, new) {
+	name := ktypes.NamespacedName{Namespace: new.Namespace, Name: new.Name}
+	npwnft.serviceLock.Lock()
+	if old == nil {
+		old = npwnft.services[name]
+	}
+	npwnft.serviceLock.Unlock()
+
+	if old != nil && serviceUpdateNotNeeded(old, new) {
 		klog.V(5).Infof("Skipping service update for: %s as change does not apply to "+
 			"any of .Spec.Ports, .Spec.ExternalIP, .Spec.ClusterIP, .Spec.ClusterIPs,"+
 			" .Spec.Type, .Status.LoadBalancer.Ingress", new.Name)
 		return nil
 	}
 
-	if util.ServiceTypeHasClusterIP(old) && util.IsClusterIPSet(old) {
+	if old != nil && util.ServiceTypeHasClusterIP(old) && util.IsClusterIPSet(old) {
 		if err = delServiceRules(old, nil, nil); err != nil {
 			errors = append(errors, err)
 		}
@@ -1627,6 +1721,9 @@ func (npwnft *nodePortWatcherNFTables) UpdateService(old, new *corev1.Service) e
 	if util.ServiceTypeHasClusterIP(new) && util.IsClusterIPSet(new) {
 		netInfo, err := npwnft.networkManager.GetActiveNetworkForNamespace(new.Namespace)
 		if err != nil {
+			if util.IsInvalidPrimaryNetworkError(err) || apierrors.IsNotFound(err) {
+				return nil
+			}
 			return fmt.Errorf("error getting active network for service %s in namespace %s: %w", new.Name, new.Namespace, err)
 		}
 		if netInfo == nil {
@@ -1641,19 +1738,48 @@ func (npwnft *nodePortWatcherNFTables) UpdateService(old, new *corev1.Service) e
 	if err = utilerrors.Join(errors...); err != nil {
 		return fmt.Errorf("UpdateService failed for nodePortWatcherNFTables: %v", err)
 	}
+
+	npwnft.serviceLock.Lock()
+	if util.ServiceTypeHasClusterIP(new) && util.IsClusterIPSet(new) {
+		npwnft.services[name] = new
+	} else {
+		delete(npwnft.services, name)
+	}
+	npwnft.serviceLock.Unlock()
+
 	return nil
 
 }
 
 func (npwnft *nodePortWatcherNFTables) DeleteService(service *corev1.Service) error {
+	name := ktypes.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+	npwnft.serviceLock.Lock()
+	savedSvc, exists := npwnft.services[name]
+	npwnft.serviceLock.Unlock()
+
+	targetSvc := service
+	if exists {
+		targetSvc = savedSvc
+	}
+
 	// don't process headless service
-	if !util.ServiceTypeHasClusterIP(service) || !util.IsClusterIPSet(service) {
+	if !util.ServiceTypeHasClusterIP(targetSvc) || !util.IsClusterIPSet(targetSvc) {
+		if exists {
+			npwnft.serviceLock.Lock()
+			delete(npwnft.services, name)
+			npwnft.serviceLock.Unlock()
+		}
 		return nil
 	}
 
-	if err := delServiceRules(service, nil, nil); err != nil {
+	if err := delServiceRules(targetSvc, nil, nil); err != nil {
 		return fmt.Errorf("DeleteService failed for nodePortWatcherNFTables: %v", err)
 	}
+
+	npwnft.serviceLock.Lock()
+	delete(npwnft.services, name)
+	npwnft.serviceLock.Unlock()
+
 	return nil
 }
 
@@ -1661,6 +1787,17 @@ func (npwnft *nodePortWatcherNFTables) SyncServices(services []interface{}) erro
 	var err error
 	var errors []error
 	var keepNFTObjects, nftContainers []knftables.Object
+
+	npwnft.serviceLock.Lock()
+	for _, serviceInterface := range services {
+		if service, ok := serviceInterface.(*corev1.Service); ok {
+			if util.ServiceTypeHasClusterIP(service) && util.IsClusterIPSet(service) {
+				name := ktypes.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+				npwnft.services[name] = service
+			}
+		}
+	}
+	npwnft.serviceLock.Unlock()
 	for _, serviceInterface := range services {
 		service, ok := serviceInterface.(*corev1.Service)
 		if !ok {
@@ -1812,7 +1949,7 @@ func newGateway(
 				npw.updateGatewayIPs()
 			}
 			// Services create OpenFlow flows as well, need to update them all
-			if gw.servicesRetryFramework != nil {
+			if gw.serviceQueue != nil {
 				if errs := gw.resyncAllServices(); len(errs) > 0 {
 					err := utilerrors.Join(errs...)
 					klog.Errorf("Failed to sync all services after node IP change: %v", err)
@@ -1838,6 +1975,9 @@ func newGateway(
 		return nil
 	}
 	gw.watchFactory = watchFactory.(*factory.WatchFactory)
+	if err := gw.initHandlers(); err != nil {
+		return nil, err
+	}
 	klog.Info("Gateway Creation Complete")
 	return gw, nil
 }

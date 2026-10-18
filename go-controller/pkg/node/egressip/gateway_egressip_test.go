@@ -401,6 +401,41 @@ var _ = ginkgo.Describe("Gateway EgressIP", func() {
 				egressip.GetNetlinkAddress(net.ParseIP(ipV4Addr), bridgeLinkIndex))).Should(gomega.BeTrue(), "should add valid OVN IP to bridge")
 		})
 	})
+
+	ginkgo.Context("EnsureEgressIP and DeleteEgressIPByName", func() {
+		ginkgo.It("EnsureEgressIP adds and updates assignment, and DeleteEgressIPByName cleans it up", func() {
+			nlLinkMock.On("Attrs").Return(&netlink.LinkAttrs{Name: bridgeName, Index: bridgeLinkIndex}, nil)
+			nlMock.On("LinkByName", bridgeName).Return(nlLinkMock, nil)
+			nlMock.On("LinkByIndex", bridgeLinkIndex).Return(nlLinkMock, nil)
+			nlMock.On("LinkList").Return([]netlink.Link{nlLinkMock}, nil)
+			nlMock.On("AddrList", nlLinkMock, 0).Return([]netlink.Addr{}, nil)
+			nlMock.On("AddrAdd", nlLinkMock, egressip.GetNetlinkAddress(net.ParseIP(ipV4Addr), bridgeLinkIndex)).Return(nil)
+			nlMock.On("AddrDel", nlLinkMock, egressip.GetNetlinkAddress(net.ParseIP(ipV4Addr), bridgeLinkIndex)).Return(nil)
+
+			addrMgr, stopFn := initBridgeEIPAddrManager(nodeName, bridgeName, emptyAnnotation)
+			defer stopFn()
+
+			eip := getEIPAssignedToNode(nodeName, mark, ipV4Addr)
+			isUpdated, err := addrMgr.EnsureEgressIP(eip)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+			gomega.Expect(isUpdated).Should(gomega.BeTrue())
+
+			// EnsureEgressIP when unchanged should return false, nil
+			isUpdated, err = addrMgr.EnsureEgressIP(eip)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+			gomega.Expect(isUpdated).Should(gomega.BeFalse())
+
+			// DeleteEgressIPByName should remove it
+			isUpdated, err = addrMgr.DeleteEgressIPByName(eip.Name)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+			gomega.Expect(isUpdated).Should(gomega.BeTrue())
+
+			// Repeated DeleteEgressIPByName should return false, nil
+			isUpdated, err = addrMgr.DeleteEgressIPByName(eip.Name)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+			gomega.Expect(isUpdated).Should(gomega.BeFalse())
+		})
+	})
 })
 
 func initBridgeEIPAddrManager(nodeName, bridgeName string, bridgeEIPAnnot string) (*BridgeEIPAddrManager, func()) {

@@ -322,6 +322,7 @@ func (nc *DefaultNodeNetworkController) initGatewayPreStart(
 	}
 
 	if err := nodeAnnotator.Run(); err != nil {
+		gw.Stop()
 		return nil, fmt.Errorf("failed to set node %s annotations: %w", nc.name, err)
 	}
 
@@ -331,6 +332,7 @@ func (nc *DefaultNodeNetworkController) initGatewayPreStart(
 	// Wait for management port and gateway resources to be created by the master
 	start := time.Now()
 	if err := waiter.Wait(); err != nil {
+		gw.Stop()
 		return nil, err
 	}
 	klog.Infof("Gateway and management port readiness took %v", time.Since(start))
@@ -518,6 +520,9 @@ func (nc *DefaultNodeNetworkController) initGatewayDPUHost() error {
 		gw.portClaimWatcher = portClaimWatcher
 	}
 
+	if err := gw.initHandlers(); err != nil {
+		return err
+	}
 	err = gw.Init(nc.stopChan, nc.wg)
 	nc.Gateway = gw
 	return err
