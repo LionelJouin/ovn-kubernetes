@@ -10,26 +10,18 @@ import (
 	ocpcloudnetworkapi "github.com/openshift/api/cloudnetwork/v1"
 
 	corev1 "k8s.io/api/core/v1"
-	cache "k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
-	objretry "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
 
 // egressIPClusterControllerEventHandler object handles the events
-// from retry framework for the egressIPClusterController.
+// for the egressIPClusterController.
 type egressIPClusterControllerEventHandler struct {
-	objretry.DefaultEventHandler
-	objType  reflect.Type
-	eIPC     *egressIPClusterController
-	syncFunc func([]interface{}) error
-}
-
-func (h *egressIPClusterControllerEventHandler) FilterOutResource(_ interface{}) bool {
-	return false
+	objType reflect.Type
+	eIPC    *egressIPClusterController
 }
 
 // egressIPClusterControllerEventHandler functions
@@ -95,14 +87,20 @@ func (h *egressIPClusterControllerEventHandler) AddResource(obj interface{}, _ b
 // UpdateResource updates the specified object in the cluster to its version in newObj according
 // to its type and returns the error, if any, yielded during the object update.
 // The inRetryCache boolean argument is to indicate if the given resource is in the retryCache or not.
-func (h *egressIPClusterControllerEventHandler) UpdateResource(oldObj, newObj interface{}, inRetryCache bool) error {
+func (h *egressIPClusterControllerEventHandler) UpdateResource(oldObj, newObj interface{}, inRetryCache bool) (err error) {
 	switch h.objType {
 	case factory.EgressIPType:
-		oldEIP := oldObj.(*egressipv1.EgressIP)
+		var oldEIP *egressipv1.EgressIP
+		if oldObj != nil {
+			oldEIP = oldObj.(*egressipv1.EgressIP)
+		}
 		newEIP := newObj.(*egressipv1.EgressIP)
 		return h.eIPC.reconcileEgressIP(oldEIP, newEIP)
 	case factory.EgressNodeType:
-		oldNode := oldObj.(*corev1.Node)
+		var oldNode *corev1.Node
+		if oldObj != nil {
+			oldNode = oldObj.(*corev1.Node)
+		}
 		newNode := newObj.(*corev1.Node)
 
 		// EgressIP is not supported on hybrid overlay nodes
@@ -115,14 +113,44 @@ func (h *egressIPClusterControllerEventHandler) UpdateResource(oldObj, newObj in
 		// annotate the node with the egressIPConfig, but that might have
 		// happened after we processed the ADD for that object, hence keep
 		// retrying for all UPDATEs.
-		if err := h.eIPC.initEgressIPAllocator(newNode); err != nil {
-			klog.Warningf("Egress node initialization error: %v", err)
+		isCloudEgressIPConfigAltered, isHostCIDRsAltered := h.eIPC.isEgressNodeConfigAltered(newNode)
+		if initErr := h.eIPC.initEgressIPAllocator(newNode); initErr != nil {
+			klog.Warningf("Egress node initialization error: %v", initErr)
 		}
+		defer func() {
+			if err == nil {
+				h.eIPC.commitEgressNodeConfig(newNode)
+			}
+		}()
 		nodeEgressLabel := util.GetNodeEgressLabel()
-		oldLabels := oldNode.GetLabels()
 		newLabels := newNode.GetLabels()
-		_, oldHadEgressLabel := oldLabels[nodeEgressLabel]
 		_, newHasEgressLabel := newLabels[nodeEgressLabel]
+
+		var oldHadEgressLabel, oldNodeIsAssignable, isOldReady bool
+		if oldNode != nil {
+			oldLabels := oldNode.GetLabels()
+			_, oldHadEgressLabel = oldLabels[nodeEgressLabel]
+			if oldHadEgressLabel {
+				hostCIDRs, err := util.ParseNodeHostCIDRsDropNetMask(oldNode)
+				oldNodeIsAssignable = err == nil && hostCIDRs.Len() > 0
+			}
+			isOldReady = h.eIPC.isEgressNodeReady(oldNode)
+			if !isHostCIDRsAltered {
+				isHostCIDRsAltered = util.NodeHostCIDRsAnnotationChanged(oldNode, newNode)
+			}
+			if !isCloudEgressIPConfigAltered {
+				isCloudEgressIPConfigAltered = util.CloudEgressIPConfigAnnotationChanged(oldNode, newNode)
+			}
+		} else {
+			h.eIPC.nodeAllocator.Lock()
+			if eNode, exists := h.eIPC.nodeAllocator.cache[newNode.Name]; exists {
+				oldHadEgressLabel = eNode.isEgressAssignable
+				oldNodeIsAssignable = eNode.isEgressAssignable
+				isOldReady = eNode.isReady
+			}
+			h.eIPC.nodeAllocator.Unlock()
+		}
+
 		// If the node is not labeled for egress assignment, just return
 		// directly, we don't really need to set the ready / reachable
 		// status on this node if the user doesn't care about using it.
@@ -132,12 +160,6 @@ func (h *egressIPClusterControllerEventHandler) UpdateResource(oldObj, newObj in
 		// A node is only assignable when it carries the egress-assignable label
 		// and its host-cidrs annotation is present, parseable, and non-empty.
 		// Without addresses the conflict check has no data for this node.
-		oldNodeIsAssignable := oldHadEgressLabel
-		if oldNodeIsAssignable {
-			hostCIDRs, err := util.ParseNodeHostCIDRsDropNetMask(oldNode)
-			oldNodeIsAssignable = err == nil && hostCIDRs.Len() > 0
-		}
-
 		nodeIsAssignable := newHasEgressLabel
 		if nodeIsAssignable {
 			hostCIDRs, err := util.ParseNodeHostCIDRsDropNetMask(newNode)
@@ -169,13 +191,10 @@ func (h *egressIPClusterControllerEventHandler) UpdateResource(oldObj, newObj in
 
 		if oldHadEgressLabel && !newHasEgressLabel {
 			klog.Infof("Node: %s has been un-labeled, deleting it from egress assignment", newNode.Name)
-			return h.eIPC.deleteEgressNode(oldNode.Name)
+			return h.eIPC.deleteEgressNode(newNode.Name)
 		}
-		isOldReady := h.eIPC.isEgressNodeReady(oldNode)
 		isNewReady := h.eIPC.isEgressNodeReady(newNode)
 		isNewReachable := h.eIPC.isEgressNodeReachable(newNode)
-		isHostCIDRsAltered := util.NodeHostCIDRsAnnotationChanged(oldNode, newNode)
-		isCloudEgressIPConfigAltered := util.CloudEgressIPConfigAnnotationChanged(oldNode, newNode)
 		h.eIPC.setNodeEgressReady(newNode.Name, isNewReady)
 		if !oldHadEgressLabel && newHasEgressLabel {
 			klog.Infof("Node: %s has been labeled, adding it for egress assignment", newNode.Name)
@@ -223,7 +242,10 @@ func (h *egressIPClusterControllerEventHandler) UpdateResource(oldObj, newObj in
 		}
 		return nil
 	case factory.CloudPrivateIPConfigType:
-		oldCloudPrivateIPConfig := oldObj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
+		var oldCloudPrivateIPConfig *ocpcloudnetworkapi.CloudPrivateIPConfig
+		if oldObj != nil {
+			oldCloudPrivateIPConfig = oldObj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
+		}
 		newCloudPrivateIPConfig := newObj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
 		return h.eIPC.reconcileCloudPrivateIPConfig(oldCloudPrivateIPConfig, newCloudPrivateIPConfig)
 	default:
@@ -244,7 +266,7 @@ func (h *egressIPClusterControllerEventHandler) DeleteResource(obj, _ interface{
 		if util.NoHostSubnet(node) {
 			return nil
 		}
-		h.eIPC.deleteNodeForEgress(node)
+		h.eIPC.deleteNodeForEgress(node.Name)
 		nodeEgressLabel := util.GetNodeEgressLabel()
 		nodeLabels := node.GetLabels()
 		_, hasEgressLabel := nodeLabels[nodeEgressLabel]
@@ -260,56 +282,4 @@ func (h *egressIPClusterControllerEventHandler) DeleteResource(obj, _ interface{
 	default:
 		return fmt.Errorf("no delete function for object type %s", h.objType)
 	}
-}
-
-func (h *egressIPClusterControllerEventHandler) SyncFunc(objs []interface{}) error {
-	var syncFunc func([]interface{}) error
-
-	if h.syncFunc != nil {
-		// syncFunc was provided explicitly
-		syncFunc = h.syncFunc
-	} else {
-		switch h.objType {
-		case factory.EgressIPType:
-			syncFunc = h.eIPC.syncEgressIPMarkAllocator
-		case factory.EgressNodeType:
-			syncFunc = h.eIPC.initEgressNodeReachability
-		case factory.CloudPrivateIPConfigType:
-			syncFunc = h.eIPC.syncCloudPrivateIPConfigs
-
-		default:
-			return fmt.Errorf("no sync function for object type %s", h.objType)
-		}
-	}
-	if syncFunc == nil {
-		return nil
-	}
-	return syncFunc(objs)
-}
-
-// getResourceFromInformerCache returns the latest state of the object from the informers cache
-// given an object key and its type
-func (h *egressIPClusterControllerEventHandler) GetResourceFromInformerCache(key string) (interface{}, error) {
-	var obj interface{}
-	var name string
-	var err error
-
-	_, name, err = cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to split key %s: %v", key, err)
-	}
-
-	switch h.objType {
-	case factory.EgressNodeType:
-		obj, err = h.eIPC.watchFactory.GetNode(name)
-	case factory.CloudPrivateIPConfigType:
-		obj, err = h.eIPC.watchFactory.GetCloudPrivateIPConfig(name)
-	case factory.EgressIPType:
-		obj, err = h.eIPC.watchFactory.GetEgressIP(name)
-
-	default:
-		err = fmt.Errorf("object type %s not supported, cannot retrieve it from informers cache",
-			h.objType)
-	}
-	return obj, err
 }
