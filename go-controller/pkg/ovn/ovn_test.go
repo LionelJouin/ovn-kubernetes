@@ -256,6 +256,9 @@ func (o *FakeOVN) shutdown() {
 	if o.controller != nil && o.controller.nodeReconciler != nil {
 		o.controller.nodeReconciler.Stop()
 	}
+	if o.eIPController != nil {
+		o.eIPController.Stop()
+	}
 	o.watcher.Shutdown()
 	close(o.stopChan)
 	o.controller.cancelableCtx.Cancel()
@@ -309,7 +312,7 @@ func (o *FakeOVN) init(nadList []nettypes.NetworkAttachmentDefinition) {
 		Kube:      kube.Kube{KClient: o.fakeClient.KubeClient},
 		EIPClient: o.fakeClient.EgressIPClient,
 	}
-	o.eIPController = NewEIPController(
+	o.eIPController, err = NewEIPController(
 		o.nbClient,
 		kubeOVN,
 		o.watcher,
@@ -323,6 +326,7 @@ func (o *FakeOVN) init(nadList []nettypes.NetworkAttachmentDefinition) {
 		o.nodeName,
 		types.DefaultNetworkControllerName,
 	)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	if o.asf == nil {
 		o.eIPController.addressSetFactory = addressset.NewOvnAddressSetFactory(o.nbClient, config.IPv4Mode, config.IPv6Mode)

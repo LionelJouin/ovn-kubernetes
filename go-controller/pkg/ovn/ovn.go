@@ -4,6 +4,7 @@
 package ovn
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	ref "k8s.io/client-go/tools/reference"
 	"k8s.io/klog/v2"
@@ -244,26 +246,58 @@ func (oc *DefaultNetworkController) removeRemoteZonePod(pod *corev1.Pod) error {
 // WatchEgressNodes starts the watching of egress assignable nodes and calls
 // back the appropriate handler logic.
 func (oc *DefaultNetworkController) WatchEgressNodes() error {
-	_, err := oc.retryEgressNodes.WatchResource()
-	return err
+	if oc.eIPC == nil {
+		return nil
+	}
+	var runCtx context.Context
+	if oc.stopChan != nil {
+		runCtx = wait.ContextForChannel(oc.stopChan)
+	} else {
+		runCtx = context.Background()
+	}
+	return oc.eIPC.WatchNodes(runCtx, 1)
 }
 
 // WatchEgressIP starts the watching of egressip resource and calls back the
 // appropriate handler logic. It also initiates the other dedicated resource
 // handlers for egress IP setup: namespaces, pods.
 func (oc *DefaultNetworkController) WatchEgressIP() error {
-	_, err := oc.retryEgressIPs.WatchResource()
-	return err
+	if oc.eIPC == nil {
+		return nil
+	}
+	var runCtx context.Context
+	if oc.stopChan != nil {
+		runCtx = wait.ContextForChannel(oc.stopChan)
+	} else {
+		runCtx = context.Background()
+	}
+	return oc.eIPC.WatchEgressIPs(runCtx, 1)
 }
 
 func (oc *DefaultNetworkController) WatchEgressIPNamespaces() error {
-	_, err := oc.retryEgressIPNamespaces.WatchResource()
-	return err
+	if oc.eIPC == nil {
+		return nil
+	}
+	var runCtx context.Context
+	if oc.stopChan != nil {
+		runCtx = wait.ContextForChannel(oc.stopChan)
+	} else {
+		runCtx = context.Background()
+	}
+	return oc.eIPC.WatchNamespaces(runCtx, 1)
 }
 
 func (oc *DefaultNetworkController) WatchEgressIPPods() error {
-	_, err := oc.retryEgressIPPods.WatchResource()
-	return err
+	if oc.eIPC == nil {
+		return nil
+	}
+	var runCtx context.Context
+	if oc.stopChan != nil {
+		runCtx = wait.ContextForChannel(oc.stopChan)
+	} else {
+		runCtx = context.Background()
+	}
+	return oc.eIPC.WatchPods(runCtx, 1)
 }
 
 // syncNodeGateway ensures a node's gateway router is configured

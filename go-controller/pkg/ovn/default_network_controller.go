@@ -21,7 +21,6 @@ import (
 	hotypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/hybrid-overlay/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
-	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	egressqoslisters "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressqos/v1/apis/listers/egressqos/v1"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
@@ -116,15 +115,6 @@ type DefaultNetworkController struct {
 	dnsNameResolver dnsnameresolver.DNSNameResolver
 	efController    *efcontroller.EFController
 
-	// retry framework for egress IP
-	retryEgressIPs *retry.RetryFramework
-	// retry framework for egress IP Namespaces
-	retryEgressIPNamespaces *retry.RetryFramework
-	// retry framework for egress IP Pods
-	retryEgressIPPods *retry.RetryFramework
-	// retry framework for Egress nodes
-	retryEgressNodes *retry.RetryFramework
-
 	// Node-specific syncMaps used by node event handler
 	gatewaysFailed              sync.Map
 	mgmtPortFailed              sync.Map
@@ -132,8 +122,6 @@ type DefaultNetworkController struct {
 	nodeClusterRouterPortFailed sync.Map
 	hybridOverlayFailed         sync.Map
 	syncZoneICFailed            sync.Map
-	syncEIPNodeRerouteFailed    sync.Map
-	syncEIPNodeFailed           sync.Map
 
 	// variable to determine if all pods present on the node during startup have been processed
 	// updated atomically
@@ -269,19 +257,16 @@ func newDefaultNetworkControllerCommon(
 
 	oc.initRetryFramework()
 	if oc.eIPC != nil {
-		oc.eIPC.retryEgressIPPods = oc.retryEgressIPPods
+		if err := oc.eIPC.Init(defaultStopChan, defaultWg); err != nil {
+			return nil, err
+		}
 	}
 	return oc, nil
 }
 
 func (oc *DefaultNetworkController) initRetryFramework() {
-	// Init the retry framework for pods, namespaces, network policies, egress firewalls,
-	// egress IP (and dependent namespaces, pods, nodes), cloud private ip config.
+	// Init the retry framework for pods, namespaces, network policies
 	oc.retryPods = oc.newRetryFramework(factory.PodType)
-	oc.retryEgressIPs = oc.newRetryFramework(factory.EgressIPType)
-	oc.retryEgressIPNamespaces = oc.newRetryFramework(factory.EgressIPNamespaceType)
-	oc.retryEgressIPPods = oc.newRetryFramework(factory.EgressIPPodType)
-	oc.retryEgressNodes = oc.newRetryFramework(factory.EgressNodeType)
 	oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 	oc.retryNetworkPolicies = oc.newRetryFramework(factory.PolicyType)
 }
@@ -363,7 +348,7 @@ func (oc *DefaultNetworkController) Stop() {
 		oc.efController.Stop()
 	}
 	if oc.eIPC != nil {
-		oc.eIPC.StopNADReconciler()
+		oc.eIPC.Stop()
 	}
 	if oc.routeImportManager != nil {
 		oc.routeImportManager.ForgetNetwork(oc.GetNetworkName())
@@ -1005,7 +990,7 @@ func (h *defaultNetworkControllerEventHandler) IsResourceScheduled(obj interface
 // AddResource adds the specified object to the cluster according to its type and returns the error,
 // if any, yielded during object creation.
 // Given an object to add and a boolean specifying if the function was executed from iterateRetryResources
-func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, fromRetryLoop bool) error {
+func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, _ bool) error {
 	switch h.objType {
 	case factory.PodType:
 		pod, ok := obj.(*corev1.Pod)
@@ -1013,65 +998,6 @@ func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, from
 			return fmt.Errorf("could not cast %T object to *corev1.Pod", obj)
 		}
 		return h.oc.ensurePod(nil, pod, true)
-
-	case factory.EgressIPType:
-		eIP := obj.(*egressipv1.EgressIP)
-		return h.oc.eIPC.reconcileEgressIP(nil, eIP)
-
-	case factory.EgressIPNamespaceType:
-		namespace := obj.(*corev1.Namespace)
-		return h.oc.eIPC.reconcileEgressIPNamespace(nil, namespace)
-
-	case factory.EgressIPPodType:
-		pod := obj.(*corev1.Pod)
-		return h.oc.eIPC.reconcileEgressIPPod(nil, pod)
-
-	case factory.EgressNodeType:
-		node := obj.(*corev1.Node)
-		// Record the node while holding the same keyed lock used by EgressIP
-		// programming.
-		h.oc.eIPC.nodeState.LockKey(node.Name)
-		h.oc.eIPC.nodeState.Store(node.Name, struct{}{})
-		h.oc.eIPC.nodeState.UnlockKey(node.Name)
-
-		shouldSyncReroute := true
-		shouldSyncEIPNode := true
-		if fromRetryLoop {
-			_, shouldSyncReroute = h.oc.syncEIPNodeRerouteFailed.Load(node.Name)
-			_, shouldSyncEIPNode = h.oc.syncEIPNodeFailed.Load(node.Name)
-			// addEgressNode runs after the reroute setup, so a reroute failure
-			// means that the egress node setup was never attempted.
-			shouldSyncEIPNode = shouldSyncEIPNode || shouldSyncReroute
-		}
-
-		if shouldSyncReroute {
-			// add the 103 qos rule to new node's switch
-			// NOTE: We don't need to remove this on node delete since entire node switch will get cleaned up
-			if h.oc.isLocalNode(node) {
-				if err := h.oc.eIPC.ensureDefaultNoRerouteQoSRules(node.Name); err != nil {
-					h.oc.syncEIPNodeRerouteFailed.Store(node.Name, true)
-					return err
-				}
-			}
-			// add the nodeIP to the default LRP (102 priority) destination address-set
-			err := h.oc.eIPC.ensureDefaultNoRerouteNodePolicies()
-			if err != nil {
-				h.oc.syncEIPNodeRerouteFailed.Store(node.Name, true)
-				return err
-			}
-			h.oc.syncEIPNodeRerouteFailed.Delete(node.Name)
-		}
-		if shouldSyncEIPNode {
-			// Add routing specific to Egress IP NOTE: GARP configuration that
-			// Egress IP depends on is added from the gateway reconciliation logic
-			err := h.oc.eIPC.addEgressNode(node)
-			if err != nil {
-				h.oc.syncEIPNodeFailed.Store(node.Name, true)
-				return err
-			}
-			h.oc.syncEIPNodeFailed.Delete(node.Name)
-		}
-		return nil
 
 	case factory.NamespaceType:
 		ns, ok := obj.(*corev1.Namespace)
@@ -1097,64 +1023,6 @@ func (h *defaultNetworkControllerEventHandler) UpdateResource(oldObj, newObj int
 
 		return h.oc.ensurePod(oldPod, newPod, inRetryCache || util.PodScheduled(oldPod) != util.PodScheduled(newPod))
 
-	case factory.EgressIPType:
-		oldEIP := oldObj.(*egressipv1.EgressIP)
-		newEIP := newObj.(*egressipv1.EgressIP)
-		return h.oc.eIPC.reconcileEgressIP(oldEIP, newEIP)
-
-	case factory.EgressIPNamespaceType:
-		oldNamespace := oldObj.(*corev1.Namespace)
-		newNamespace := newObj.(*corev1.Namespace)
-		return h.oc.eIPC.reconcileEgressIPNamespace(oldNamespace, newNamespace)
-
-	case factory.EgressIPPodType:
-		oldPod := oldObj.(*corev1.Pod)
-		newPod := newObj.(*corev1.Pod)
-		return h.oc.eIPC.reconcileEgressIPPod(oldPod, newPod)
-
-	case factory.EgressNodeType:
-		oldNode := oldObj.(*corev1.Node)
-		newNode := newObj.(*corev1.Node)
-		// Refresh node presence while holding the same keyed lock used by
-		// EgressIP programming.
-		h.oc.eIPC.nodeState.LockKey(newNode.Name)
-		h.oc.eIPC.nodeState.Store(newNode.Name, struct{}{})
-		h.oc.eIPC.nodeState.UnlockKey(newNode.Name)
-
-		_, rerouteRetryPending := h.oc.syncEIPNodeRerouteFailed.Load(newNode.Name)
-		newNodeIsLocal := h.oc.isLocalNode(newNode)
-
-		// Retry previously failed reroute configuration for the local node.
-		if rerouteRetryPending && newNodeIsLocal {
-			if err := h.oc.eIPC.ensureDefaultNoRerouteQoSRules(newNode.Name); err != nil {
-				h.oc.syncEIPNodeRerouteFailed.Store(newNode.Name, true)
-				return err
-			}
-		}
-		// update the nodeIP in the default-reRoute (102 priority) destination address-set
-		if rerouteRetryPending || util.NodeHostCIDRsAnnotationChanged(oldNode, newNode) {
-			klog.Infof("Egress IP detected IP address change for node %s. Updating no re-route policies", newNode.Name)
-			err := h.oc.eIPC.ensureDefaultNoRerouteNodePolicies()
-			if err != nil {
-				h.oc.syncEIPNodeRerouteFailed.Store(newNode.Name, true)
-				return err
-			}
-			h.oc.syncEIPNodeRerouteFailed.Delete(newNode.Name)
-		}
-
-		_, syncEIPNodeFailed := h.oc.syncEIPNodeFailed.Load(newNode.Name)
-		// A reroute failure from AddResource prevented addEgressNode from
-		// running. Retry it after the reroute setup succeeds.
-		if syncEIPNodeFailed || rerouteRetryPending {
-			err := h.oc.eIPC.addEgressNode(newNode)
-			if err != nil {
-				h.oc.syncEIPNodeFailed.Store(newNode.Name, true)
-				return err
-			}
-			h.oc.syncEIPNodeFailed.Delete(newNode.Name)
-		}
-		return nil
-
 	case factory.NamespaceType:
 		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
 		return h.oc.updateNamespace(oldNs, newNs)
@@ -1175,34 +1043,6 @@ func (h *defaultNetworkControllerEventHandler) DeleteResource(obj, cachedObj int
 			portInfo = cachedObj.(*lpInfo)
 		}
 		return h.oc.removePod(pod, portInfo)
-
-	case factory.EgressIPType:
-		eIP := obj.(*egressipv1.EgressIP)
-		return h.oc.eIPC.reconcileEgressIP(eIP, nil)
-
-	case factory.EgressIPNamespaceType:
-		namespace := obj.(*corev1.Namespace)
-		return h.oc.eIPC.reconcileEgressIPNamespace(namespace, nil)
-
-	case factory.EgressIPPodType:
-		pod := obj.(*corev1.Pod)
-		return h.oc.eIPC.reconcileEgressIPPod(pod, nil)
-
-	case factory.EgressNodeType:
-		node := obj.(*corev1.Node)
-		// remove the IPs from the destination address-set of the default LRP (102)
-		err := h.oc.eIPC.ensureDefaultNoRerouteNodePolicies()
-		if err != nil {
-			return err
-		}
-		// Remove the node while holding the same keyed lock used by EgressIP
-		// programming.
-		h.oc.eIPC.nodeState.LockKey(node.Name)
-		h.oc.eIPC.nodeState.Delete(node.Name)
-		h.oc.eIPC.nodeState.UnlockKey(node.Name)
-		h.oc.syncEIPNodeRerouteFailed.Delete(node.Name)
-		h.oc.syncEIPNodeFailed.Delete(node.Name)
-		return nil
 
 	case factory.NamespaceType:
 		ns := obj.(*corev1.Namespace)
@@ -1226,16 +1066,6 @@ func (h *defaultNetworkControllerEventHandler) SyncFunc(objs []interface{}) erro
 
 		case factory.PolicyType:
 			syncFunc = h.oc.syncNetworkPolicies
-
-		case factory.EgressIPPodType:
-			syncFunc = h.oc.eIPC.syncEgressIPs
-
-		case factory.EgressNodeType:
-			syncFunc = h.oc.eIPC.initClusterEgressPolicies
-
-		case factory.EgressIPNamespaceType,
-			factory.EgressIPType:
-			syncFunc = nil
 
 		case factory.NamespaceType:
 			syncFunc = h.oc.syncNamespaces

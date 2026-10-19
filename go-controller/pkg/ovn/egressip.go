@@ -50,7 +50,6 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/addresssetmanager"
 	egresssvc "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/controller/egressservice"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/controller/udnenabledsvc"
-	ovnretry "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/syncmap"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
@@ -214,8 +213,27 @@ type EgressIPController struct {
 	nadReconciler           networkmanager.NADReconciler
 	nadReconcilerID         uint64
 	nadReconcilerRegistered bool
-	// retryEgressIPPods allows requeuing egressIP pod processing on NAD changes
-	retryEgressIPPods *ovnretry.RetryFramework
+
+	egressNodeQueue   workqueue.TypedRateLimitingInterface[string]
+	egressNodeHandler cache.ResourceEventHandlerRegistration
+	egressNodeCache   sync.Map // map[string]*corev1.Node
+
+	egressIPQueue         workqueue.TypedRateLimitingInterface[string]
+	egressIPHandler       cache.ResourceEventHandlerRegistration
+	egressIPResourceCache sync.Map // map[string]*egressipv1.EgressIP
+
+	egressIPNamespaceQueue   workqueue.TypedRateLimitingInterface[string]
+	egressIPNamespaceHandler cache.ResourceEventHandlerRegistration
+	egressIPNamespaceCache   sync.Map // map[string]*corev1.Namespace
+
+	egressIPPodQueue   workqueue.TypedRateLimitingInterface[string]
+	egressIPPodHandler cache.ResourceEventHandlerRegistration
+	egressIPPodCache   sync.Map // map[string]*corev1.Pod
+
+	stopOnce sync.Once
+	stopChan <-chan struct{}
+	wg       *sync.WaitGroup
+
 	// An address set factory that creates address sets
 	addressSetFactory addressset.AddressSetFactory
 	// Shared address set manager that owns cluster-wide node IP address sets.
@@ -241,7 +259,7 @@ func NewEIPController(
 	v6 bool,
 	nodeName string,
 	controllerName string,
-) *EgressIPController {
+) (*EgressIPController, error) {
 	e := &EgressIPController{
 		nbClient:          nbClient,
 		kube:              kube,
@@ -269,7 +287,764 @@ func NewEIPController(
 		controllerName+"-egressip-nad",
 		nadReconcilerConfig,
 	)
-	return e
+	if err := e.initHandlers(); err != nil {
+		return nil, fmt.Errorf("failed to initialize handlers for EgressIPController: %w", err)
+	}
+	return e, nil
+}
+
+func (e *EgressIPController) isLocalNode(node *corev1.Node) bool {
+	return node != nil && node.Name == e.nodeName
+}
+
+func (e *EgressIPController) initHandlers() error {
+	if e.watchFactory == nil {
+		return nil
+	}
+
+	e.egressNodeQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "ovn-egress-nodes"},
+	)
+	e.egressIPQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "ovn-egress-ips"},
+	)
+	e.egressIPNamespaceQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "ovn-egress-namespaces"},
+	)
+	e.egressIPPodQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "ovn-egress-pods"},
+	)
+
+	var err error
+	e.egressNodeHandler, err = e.watchFactory.NodeInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    e.onEgressNodeAdd,
+			UpdateFunc: e.onEgressNodeUpdate,
+			DeleteFunc: e.onEgressNodeDelete,
+		}),
+	)
+	if err != nil {
+		e.Stop()
+		return fmt.Errorf("failed to add Node event handler for EgressIP: %w", err)
+	}
+
+	e.egressIPHandler, err = e.watchFactory.EgressIPInformer().Informer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    e.onEgressIPAdd,
+			UpdateFunc: e.onEgressIPUpdate,
+			DeleteFunc: e.onEgressIPDelete,
+		}),
+	)
+	if err != nil {
+		e.Stop()
+		return fmt.Errorf("failed to add EgressIP event handler: %w", err)
+	}
+
+	e.egressIPNamespaceHandler, err = e.watchFactory.NamespaceInformer().Informer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    e.onEgressIPNamespaceAdd,
+			UpdateFunc: e.onEgressIPNamespaceUpdate,
+			DeleteFunc: e.onEgressIPNamespaceDelete,
+		}),
+	)
+	if err != nil {
+		e.Stop()
+		return fmt.Errorf("failed to add Namespace event handler for EgressIP: %w", err)
+	}
+
+	e.egressIPPodHandler, err = e.watchFactory.PodInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    e.onEgressIPPodAdd,
+			UpdateFunc: e.onEgressIPPodUpdate,
+			DeleteFunc: e.onEgressIPPodDelete,
+		}),
+	)
+	if err != nil {
+		e.Stop()
+		return fmt.Errorf("failed to add Pod event handler for EgressIP: %w", err)
+	}
+
+	return nil
+}
+
+func (e *EgressIPController) Init(stopChan <-chan struct{}, wg *sync.WaitGroup) error {
+	e.stopChan = stopChan
+	e.wg = wg
+	return nil
+}
+
+func (e *EgressIPController) Stop() {
+	e.stopOnce.Do(e.stop)
+}
+
+func (e *EgressIPController) stop() {
+	e.StopNADReconciler()
+
+	if e.egressNodeQueue != nil {
+		e.egressNodeQueue.ShutDown()
+	}
+	if e.egressIPQueue != nil {
+		e.egressIPQueue.ShutDown()
+	}
+	if e.egressIPNamespaceQueue != nil {
+		e.egressIPNamespaceQueue.ShutDown()
+	}
+	if e.egressIPPodQueue != nil {
+		e.egressIPPodQueue.ShutDown()
+	}
+
+	if e.egressNodeHandler != nil {
+		_ = e.watchFactory.NodeInformer().RemoveEventHandler(e.egressNodeHandler)
+		e.egressNodeHandler = nil
+	}
+	if e.egressIPHandler != nil {
+		_ = e.watchFactory.EgressIPInformer().Informer().RemoveEventHandler(e.egressIPHandler)
+		e.egressIPHandler = nil
+	}
+	if e.egressIPNamespaceHandler != nil {
+		_ = e.watchFactory.NamespaceInformer().Informer().RemoveEventHandler(e.egressIPNamespaceHandler)
+		e.egressIPNamespaceHandler = nil
+	}
+	if e.egressIPPodHandler != nil {
+		_ = e.watchFactory.PodInformer().RemoveEventHandler(e.egressIPPodHandler)
+		e.egressIPPodHandler = nil
+	}
+}
+
+func (e *EgressIPController) onEgressNodeAdd(obj interface{}) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return
+	}
+	e.egressNodeQueue.Add(node.Name)
+}
+
+func (e *EgressIPController) onEgressNodeUpdate(oldObj, newObj interface{}) {
+	oldNode, ok1 := oldObj.(*corev1.Node)
+	newNode, ok2 := newObj.(*corev1.Node)
+	if !ok1 || !ok2 {
+		return
+	}
+	if reflect.DeepEqual(oldNode.Status.Addresses, newNode.Status.Addresses) &&
+		reflect.DeepEqual(oldNode.Annotations, newNode.Annotations) &&
+		reflect.DeepEqual(oldNode.Labels, newNode.Labels) {
+		return
+	}
+	e.egressNodeQueue.Add(newNode.Name)
+}
+
+func (e *EgressIPController) onEgressNodeDelete(obj interface{}) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		node, ok = tombstone.Obj.(*corev1.Node)
+		if !ok {
+			return
+		}
+	}
+	e.egressNodeCache.LoadOrStore(node.Name, node.DeepCopy())
+	e.egressNodeQueue.Add(node.Name)
+}
+
+func (e *EgressIPController) runNodeWorker(_ context.Context) {
+	for e.processNodeItem() {
+	}
+}
+
+func (e *EgressIPController) processNodeItem() bool {
+	nodeName, shutdown := e.egressNodeQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer e.egressNodeQueue.Done(nodeName)
+
+	err := e.reconcileNode(nodeName)
+	if err != nil {
+		numRequeues := e.egressNodeQueue.NumRequeues(nodeName)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling egress node %s (attempt %d): %v, requeuing", nodeName, numRequeues, err)
+		} else {
+			klog.V(4).Infof("Error reconciling egress node %s (attempt %d): %v, requeuing", nodeName, numRequeues, err)
+		}
+		e.egressNodeQueue.AddRateLimited(nodeName)
+		return true
+	}
+	e.egressNodeQueue.Forget(nodeName)
+	return true
+}
+
+func (e *EgressIPController) reconcileNode(nodeName string) error {
+	cachedVal, hadCached := e.egressNodeCache.Load(nodeName)
+	curNode, err := e.watchFactory.GetNode(nodeName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if hadCached {
+				if err := e.ensureDefaultNoRerouteNodePolicies(); err != nil {
+					return err
+				}
+				e.nodeState.LockKey(nodeName)
+				e.nodeState.Delete(nodeName)
+				e.nodeState.UnlockKey(nodeName)
+				e.egressNodeCache.Delete(nodeName)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+
+	e.nodeState.LockKey(curNode.Name)
+	e.nodeState.Store(curNode.Name, struct{}{})
+	e.nodeState.UnlockKey(curNode.Name)
+
+	if hadCached {
+		oldNode := cachedVal.(*corev1.Node)
+		if oldNode.UID != curNode.UID {
+			e.egressNodeCache.Delete(nodeName)
+
+			if e.isLocalNode(curNode) {
+				if err := e.ensureDefaultNoRerouteQoSRules(curNode.Name); err != nil {
+					return err
+				}
+			}
+			if err := e.ensureDefaultNoRerouteNodePolicies(); err != nil {
+				return err
+			}
+			if err := e.addEgressNode(curNode); err != nil {
+				return err
+			}
+		} else {
+			if util.NodeHostCIDRsAnnotationChanged(oldNode, curNode) {
+				klog.Infof("Egress IP detected IP address change for node %s. Updating no re-route policies", curNode.Name)
+				if err := e.ensureDefaultNoRerouteNodePolicies(); err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		if e.isLocalNode(curNode) {
+			if err := e.ensureDefaultNoRerouteQoSRules(curNode.Name); err != nil {
+				return err
+			}
+		}
+		if err := e.ensureDefaultNoRerouteNodePolicies(); err != nil {
+			return err
+		}
+		if err := e.addEgressNode(curNode); err != nil {
+			return err
+		}
+	}
+	e.egressNodeCache.Store(nodeName, curNode.DeepCopy())
+	return nil
+}
+
+func (e *EgressIPController) WatchNodes(ctx context.Context, workers int) error {
+	nodes, err := e.watchFactory.GetNodes()
+	if err != nil {
+		return fmt.Errorf("unable to list nodes for initial sync: %w", err)
+	}
+	nodeObjs := make([]interface{}, len(nodes))
+	for i, n := range nodes {
+		nodeObjs[i] = n
+	}
+	if err := e.initClusterEgressPolicies(nodeObjs); err != nil {
+		return err
+	}
+	if err := e.ensureDefaultNoRerouteNodePolicies(); err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		e.nodeState.LockKey(n.Name)
+		e.nodeState.Store(n.Name, struct{}{})
+		e.nodeState.UnlockKey(n.Name)
+		if e.isLocalNode(n) {
+			if err := e.ensureDefaultNoRerouteQoSRules(n.Name); err != nil {
+				return err
+			}
+			if err := e.addEgressNode(n); err != nil {
+				klog.Warningf("Could not add egress node %s at startup: %v, will retry via queue", n.Name, err)
+				e.egressNodeQueue.AddRateLimited(n.Name)
+				continue
+			}
+		}
+		e.egressNodeCache.Store(n.Name, n.DeepCopy())
+	}
+	return e.WatchNodesWithWorkers(ctx, workers)
+}
+
+func (e *EgressIPController) WatchNodesWithWorkers(ctx context.Context, workers int) error {
+	if e.egressNodeQueue == nil {
+		return fmt.Errorf("egressNodeQueue is not initialized")
+	}
+	if e.wg == nil {
+		return fmt.Errorf("egress node controller has not been initialized: wg is nil")
+	}
+
+	for i := 0; i < workers; i++ {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			wait.UntilWithContext(ctx, e.runNodeWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (e *EgressIPController) onEgressIPAdd(obj interface{}) {
+	eip, ok := obj.(*egressipv1.EgressIP)
+	if !ok {
+		return
+	}
+	e.egressIPQueue.Add(eip.Name)
+}
+
+func (e *EgressIPController) onEgressIPUpdate(oldObj, newObj interface{}) {
+	oldEIP, ok1 := oldObj.(*egressipv1.EgressIP)
+	newEIP, ok2 := newObj.(*egressipv1.EgressIP)
+	if !ok1 || !ok2 {
+		return
+	}
+	if reflect.DeepEqual(oldEIP.Spec, newEIP.Spec) &&
+		reflect.DeepEqual(oldEIP.Status, newEIP.Status) &&
+		reflect.DeepEqual(oldEIP.Annotations, newEIP.Annotations) {
+		return
+	}
+	e.egressIPQueue.Add(newEIP.Name)
+}
+
+func (e *EgressIPController) onEgressIPDelete(obj interface{}) {
+	eip, ok := obj.(*egressipv1.EgressIP)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		eip, ok = tombstone.Obj.(*egressipv1.EgressIP)
+		if !ok {
+			return
+		}
+	}
+	e.egressIPResourceCache.LoadOrStore(eip.Name, eip.DeepCopy())
+	e.egressIPQueue.Add(eip.Name)
+}
+
+func (e *EgressIPController) runEgressIPWorker(_ context.Context) {
+	for e.processEgressIPItem() {
+	}
+}
+
+func (e *EgressIPController) processEgressIPItem() bool {
+	name, shutdown := e.egressIPQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer e.egressIPQueue.Done(name)
+
+	err := e.reconcileEgressIPItem(name)
+	if err != nil {
+		numRequeues := e.egressIPQueue.NumRequeues(name)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling egress IP %s (attempt %d): %v, requeuing", name, numRequeues, err)
+		} else {
+			klog.V(4).Infof("Error reconciling egress IP %s (attempt %d): %v, requeuing", name, numRequeues, err)
+		}
+		e.egressIPQueue.AddRateLimited(name)
+		return true
+	}
+	e.egressIPQueue.Forget(name)
+	return true
+}
+
+func (e *EgressIPController) reconcileEgressIPItem(name string) error {
+	cachedVal, hadCached := e.egressIPResourceCache.Load(name)
+	curEIP, err := e.watchFactory.GetEgressIP(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if hadCached {
+				oldEIP := cachedVal.(*egressipv1.EgressIP)
+				if err := e.reconcileEgressIP(oldEIP, nil); err != nil {
+					return err
+				}
+				e.egressIPResourceCache.Delete(name)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get egress IP %s: %w", name, err)
+	}
+
+	if hadCached {
+		oldEIP := cachedVal.(*egressipv1.EgressIP)
+		if oldEIP.UID != curEIP.UID {
+			if err := e.reconcileEgressIP(oldEIP, nil); err != nil {
+				return err
+			}
+			e.egressIPResourceCache.Delete(name)
+			if err := e.reconcileEgressIP(nil, curEIP); err != nil {
+				return err
+			}
+		} else {
+			if err := e.reconcileEgressIP(oldEIP, curEIP); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := e.reconcileEgressIP(nil, curEIP); err != nil {
+			return err
+		}
+	}
+	e.egressIPResourceCache.Store(name, curEIP.DeepCopy())
+	return nil
+}
+
+func (e *EgressIPController) WatchEgressIPs(ctx context.Context, workers int) error {
+	egressIPs, err := e.watchFactory.GetEgressIPs()
+	if err != nil {
+		return fmt.Errorf("failed to get egress IPs for initial sync: %w", err)
+	}
+	for _, eip := range egressIPs {
+		if err := e.reconcileEgressIPItem(eip.Name); err != nil {
+			klog.Warningf("Initial reconcile of egress IP %s failed, requeuing: %v", eip.Name, err)
+			e.egressIPQueue.AddRateLimited(eip.Name)
+		}
+	}
+	return e.WatchEgressIPsWithWorkers(ctx, workers)
+}
+
+func (e *EgressIPController) WatchEgressIPsWithWorkers(ctx context.Context, workers int) error {
+	if e.egressIPQueue == nil {
+		return fmt.Errorf("egressIPQueue is not initialized")
+	}
+	if e.wg == nil {
+		return fmt.Errorf("egress IP controller has not been initialized: wg is nil")
+	}
+
+	for i := 0; i < workers; i++ {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			wait.UntilWithContext(ctx, e.runEgressIPWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (e *EgressIPController) onEgressIPNamespaceAdd(obj interface{}) {
+	ns, ok := obj.(*corev1.Namespace)
+	if !ok {
+		return
+	}
+	e.egressIPNamespaceQueue.Add(ns.Name)
+}
+
+func (e *EgressIPController) onEgressIPNamespaceUpdate(oldObj, newObj interface{}) {
+	oldNS, ok1 := oldObj.(*corev1.Namespace)
+	newNS, ok2 := newObj.(*corev1.Namespace)
+	if !ok1 || !ok2 {
+		return
+	}
+	if reflect.DeepEqual(oldNS.Labels, newNS.Labels) {
+		return
+	}
+	e.egressIPNamespaceQueue.Add(newNS.Name)
+}
+
+func (e *EgressIPController) onEgressIPNamespaceDelete(obj interface{}) {
+	ns, ok := obj.(*corev1.Namespace)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		ns, ok = tombstone.Obj.(*corev1.Namespace)
+		if !ok {
+			return
+		}
+	}
+	e.egressIPNamespaceCache.LoadOrStore(ns.Name, ns.DeepCopy())
+	e.egressIPNamespaceQueue.Add(ns.Name)
+}
+
+func (e *EgressIPController) runNamespaceWorker(_ context.Context) {
+	for e.processNamespaceItem() {
+	}
+}
+
+func (e *EgressIPController) processNamespaceItem() bool {
+	name, shutdown := e.egressIPNamespaceQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer e.egressIPNamespaceQueue.Done(name)
+
+	err := e.reconcileNamespace(name)
+	if err != nil {
+		numRequeues := e.egressIPNamespaceQueue.NumRequeues(name)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling egress IP namespace %s (attempt %d): %v, requeuing", name, numRequeues, err)
+		} else {
+			klog.V(4).Infof("Error reconciling egress IP namespace %s (attempt %d): %v, requeuing", name, numRequeues, err)
+		}
+		e.egressIPNamespaceQueue.AddRateLimited(name)
+		return true
+	}
+	e.egressIPNamespaceQueue.Forget(name)
+	return true
+}
+
+func (e *EgressIPController) reconcileNamespace(name string) error {
+	cachedVal, hadCached := e.egressIPNamespaceCache.Load(name)
+	curNS, err := e.watchFactory.GetNamespace(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if hadCached {
+				oldNS := cachedVal.(*corev1.Namespace)
+				if err := e.reconcileEgressIPNamespace(oldNS, nil); err != nil {
+					return err
+				}
+				e.egressIPNamespaceCache.Delete(name)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get namespace %s: %w", name, err)
+	}
+
+	if hadCached {
+		oldNS := cachedVal.(*corev1.Namespace)
+		if oldNS.UID != curNS.UID {
+			if err := e.reconcileEgressIPNamespace(oldNS, nil); err != nil {
+				return err
+			}
+			e.egressIPNamespaceCache.Delete(name)
+			if err := e.reconcileEgressIPNamespace(nil, curNS); err != nil {
+				return err
+			}
+		} else {
+			if err := e.reconcileEgressIPNamespace(oldNS, curNS); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := e.reconcileEgressIPNamespace(nil, curNS); err != nil {
+			return err
+		}
+	}
+	e.egressIPNamespaceCache.Store(name, curNS.DeepCopy())
+	return nil
+}
+
+func (e *EgressIPController) WatchNamespaces(ctx context.Context, workers int) error {
+	return e.WatchNamespacesWithWorkers(ctx, workers)
+}
+
+func (e *EgressIPController) WatchNamespacesWithWorkers(ctx context.Context, workers int) error {
+	if e.egressIPNamespaceQueue == nil {
+		return fmt.Errorf("egressIPNamespaceQueue is not initialized")
+	}
+	if e.wg == nil {
+		return fmt.Errorf("egress namespace controller has not been initialized: wg is nil")
+	}
+
+	for i := 0; i < workers; i++ {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			wait.UntilWithContext(ctx, e.runNamespaceWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (e *EgressIPController) onEgressIPPodAdd(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		return
+	}
+	e.egressIPPodQueue.Add(key)
+}
+
+func (e *EgressIPController) onEgressIPPodUpdate(oldObj, newObj interface{}) {
+	oldPod, ok1 := oldObj.(*corev1.Pod)
+	newPod, ok2 := newObj.(*corev1.Pod)
+	if !ok1 || !ok2 {
+		return
+	}
+	if reflect.DeepEqual(oldPod.Labels, newPod.Labels) &&
+		reflect.DeepEqual(oldPod.Annotations, newPod.Annotations) &&
+		reflect.DeepEqual(oldPod.Status.PodIPs, newPod.Status.PodIPs) &&
+		oldPod.Spec.NodeName == newPod.Spec.NodeName &&
+		util.PodCompleted(oldPod) == util.PodCompleted(newPod) {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(newPod)
+	if err != nil {
+		return
+	}
+	e.egressIPPodQueue.Add(key)
+}
+
+func (e *EgressIPController) onEgressIPPodDelete(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		return
+	}
+	e.egressIPPodCache.LoadOrStore(key, pod.DeepCopy())
+	e.egressIPPodQueue.Add(key)
+}
+
+func (e *EgressIPController) runPodWorker(_ context.Context) {
+	for e.processPodItem() {
+	}
+}
+
+func (e *EgressIPController) processPodItem() bool {
+	key, shutdown := e.egressIPPodQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer e.egressIPPodQueue.Done(key)
+
+	err := e.reconcilePod(key)
+	if err != nil {
+		numRequeues := e.egressIPPodQueue.NumRequeues(key)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling egress IP pod %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		} else {
+			klog.V(4).Infof("Error reconciling egress IP pod %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		}
+		e.egressIPPodQueue.AddRateLimited(key)
+		return true
+	}
+	e.egressIPPodQueue.Forget(key)
+	return true
+}
+
+func (e *EgressIPController) reconcilePod(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	cachedVal, hadCached := e.egressIPPodCache.Load(key)
+	curPod, err := e.watchFactory.GetPod(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if hadCached {
+				oldPod := cachedVal.(*corev1.Pod)
+				if !util.PodCompleted(oldPod) {
+					if err := e.reconcileEgressIPPod(oldPod, nil); err != nil {
+						return err
+					}
+				}
+				e.egressIPPodCache.Delete(key)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get pod %s: %w", key, err)
+	}
+
+	if hadCached {
+		oldPod := cachedVal.(*corev1.Pod)
+		if oldPod.UID != curPod.UID {
+			if !util.PodCompleted(oldPod) {
+				if err := e.reconcileEgressIPPod(oldPod, nil); err != nil {
+					return err
+				}
+			}
+			e.egressIPPodCache.Delete(key)
+			if !util.PodCompleted(curPod) {
+				if err := e.reconcileEgressIPPod(nil, curPod); err != nil {
+					return err
+				}
+			}
+		} else if util.PodCompleted(curPod) {
+			if !util.PodCompleted(oldPod) {
+				if err := e.reconcileEgressIPPod(oldPod, nil); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := e.reconcileEgressIPPod(oldPod, curPod); err != nil {
+				return err
+			}
+		}
+	} else {
+		if !util.PodCompleted(curPod) {
+			if err := e.reconcileEgressIPPod(nil, curPod); err != nil {
+				return err
+			}
+		}
+	}
+	e.egressIPPodCache.Store(key, curPod.DeepCopy())
+	return nil
+}
+
+func (e *EgressIPController) WatchPods(ctx context.Context, workers int) error {
+	if err := e.SyncNodeCache(); err != nil {
+		klog.Warningf("Failed to sync node cache on WatchPods: %v", err)
+	}
+
+	pods, err := e.watchFactory.GetAllPods()
+	if err != nil {
+		return fmt.Errorf("failed to get pods for initial sync: %w", err)
+	}
+	podObjs := make([]interface{}, len(pods))
+	for i, p := range pods {
+		podObjs[i] = p
+	}
+	if err := e.syncEgressIPs(podObjs); err != nil {
+		return fmt.Errorf("failed to sync egress IPs: %w", err)
+	}
+
+	for _, pod := range pods {
+		key, err := cache.MetaNamespaceKeyFunc(pod)
+		if err == nil {
+			e.egressIPPodCache.Store(key, pod.DeepCopy())
+		}
+	}
+	return e.WatchPodsWithWorkers(ctx, workers)
+}
+
+func (e *EgressIPController) WatchPodsWithWorkers(ctx context.Context, workers int) error {
+	if e.egressIPPodQueue == nil {
+		return fmt.Errorf("egressIPPodQueue is not initialized")
+	}
+	if e.wg == nil {
+		return fmt.Errorf("egress pod controller has not been initialized: wg is nil")
+	}
+
+	for i := 0; i < workers; i++ {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			wait.UntilWithContext(ctx, e.runPodWorker, time.Second)
+		}()
+	}
+
+	return nil
 }
 
 // getNetworkMutex returns the mutex for a specific network, creating it if necessary.
@@ -1475,7 +2250,7 @@ func (e *EgressIPController) syncNAD(key string) error {
 }
 
 func (e *EgressIPController) addEgressIPPodRetriesForNamespace(namespace string) {
-	if e.retryEgressIPPods == nil {
+	if e.egressIPPodQueue == nil {
 		return
 	}
 	pods, err := e.watchFactory.GetPods(namespace)
@@ -1484,24 +2259,24 @@ func (e *EgressIPController) addEgressIPPodRetriesForNamespace(namespace string)
 		return
 	}
 	for _, pod := range pods {
-		pod := *pod
-		if util.PodCompleted(&pod) {
+		if util.PodCompleted(pod) {
 			continue
 		}
-		e.addEgressIPPodRetry(&pod, "NAD change")
+		e.addEgressIPPodRetry(pod, "NAD change")
 	}
 }
 
 func (e *EgressIPController) addEgressIPPodRetry(pod *corev1.Pod, reason string) {
-	if e.retryEgressIPPods == nil || pod == nil || util.PodCompleted(pod) || !util.PodNeedsSNAT(pod) {
+	if e.egressIPPodQueue == nil || pod == nil || util.PodCompleted(pod) || !util.PodNeedsSNAT(pod) {
 		return
 	}
-	klog.V(5).Infof("Adding egress IP pod %s/%s for immediate retry due to %s", pod.Namespace, pod.Name, reason)
-	if err := e.retryEgressIPPods.AddRetryObjWithAddNoBackoff(pod); err != nil {
-		klog.Warningf("Failed to add pod %s/%s to egressIP retry queue: %v", pod.Namespace, pod.Name, err)
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		klog.Warningf("Failed to get key for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 		return
 	}
-	e.retryEgressIPPods.RequestRetryObjs()
+	klog.V(5).Infof("Adding egress IP pod %s for immediate retry due to %s", key, reason)
+	e.egressIPPodQueue.Add(key)
 }
 
 func (e *EgressIPController) syncStaleAddressSetIPs(egressIPCache egressIPCache) error {

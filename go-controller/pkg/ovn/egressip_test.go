@@ -26,13 +26,11 @@ import (
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	addressset "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/address_set"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/addresssetmanager"
 	egresssvc "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/controller/egressservice"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/syncmap"
 	ovntest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	libovsdbtest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/libovsdb"
@@ -1262,35 +1260,10 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 					// there is a chance that both egressnode events(node1 removal and node2 update) will end up in the same event queue
 					// sleep for double the time to allow for two consecutive TransactWithRetry timeouts
 					time.Sleep(2 * (config.Default.OVSDBTxnTimeout + time.Second))
-					// check to see if the retry cache has an entry
-					key1 := node1.Name
-					ginkgo.By("retry entry: old obj should not be nil")
-					retry.CheckRetryObjectMultipleFieldsEventually(
-						key1,
-						fakeOvn.controller.retryEgressNodes,
-						gomega.Not(gomega.BeNil()), // oldObj should not be nil
-						nil,
-					)
-					key2 := node2.Name
-					ginkgo.By("retry entry: old obj should be nil, new obj should not be nil, config should not be nil")
-					// (mk) FIXME: unknown why this isn't working
-					//retry.CheckRetryObjectMultipleFieldsEventually(
-					//	key2,
-					//	fakeOvn.controller.retryEgressNodes,
-					//	gomega.BeNil(),             // oldObj should be nil
-					//	gomega.Not(gomega.BeNil()), // newObj should not be nil
-					//	gomega.Not(gomega.BeNil()), // config should not be nil
-					//)
 					fakeOvn.patchEgressIPObj(node2Name, egressIPName, egressIP)
 					connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 					defer cancel()
 					resetNBClient(connCtx, fakeOvn.controller.nbClient)
-					retry.SetRetryObjWithNoBackoff(key1, fakeOvn.controller.retryEgressNodes)
-					retry.SetRetryObjWithNoBackoff(key2, fakeOvn.controller.retryEgressNodes)
-					fakeOvn.controller.retryEgressNodes.RequestRetryObjs()
-					// check the cache no longer has the entry
-					retry.CheckRetryObjectEventually(key1, false, fakeOvn.controller.retryEgressNodes)
-					retry.CheckRetryObjectEventually(key2, false, fakeOvn.controller.retryEgressNodes)
 					i, n, _ := net.ParseCIDR(podV4IP + "/23")
 					n.IP = i
 					fakeOvn.controller.logicalPortCache.add(&egressPod, "", types.DefaultNetworkName, "", nil, []*net.IPNet{n})
@@ -1662,34 +1635,9 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 					// there is a chance that both egressnode events(node1 removal and node2 update) will end up in the same event queue
 					// sleep for double the time to allow for two consecutive TransactWithRetry timeouts
 					time.Sleep(2 * (config.Default.OVSDBTxnTimeout + time.Second))
-					// check to see if the retry cache has an entry
-					key1 := node1.Name
-					ginkgo.By("retry entry: old obj should not be nil")
-					retry.CheckRetryObjectMultipleFieldsEventually(
-						key1,
-						fakeOvn.controller.retryEgressNodes,
-						gomega.Not(gomega.BeNil()), // oldObj should not be nil
-						nil,
-					)
-					key2 := node2.Name
-					ginkgo.By("retry entry: old obj should be nil, new obj should not be nil, config should not be nil")
-					// FIXME: (mk): unknown why this is not working
-					//retry.CheckRetryObjectMultipleFieldsEventually(
-					//	key2,
-					//	fakeOvn.controller.retryEgressNodes,
-					//	gomega.BeNil(),             // oldObj should be nil
-					//	gomega.Not(gomega.BeNil()), // newObj should not be nil
-					//	gomega.Not(gomega.BeNil()), // config should not be nil
-					//)
 					connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 					defer cancel()
 					resetNBClient(connCtx, fakeOvn.controller.nbClient)
-					retry.SetRetryObjWithNoBackoff(key1, fakeOvn.controller.retryEgressNodes)
-					retry.SetRetryObjWithNoBackoff(key2, fakeOvn.controller.retryEgressNodes)
-					fakeOvn.controller.retryEgressNodes.RequestRetryObjs()
-					// check the cache no longer has the entry
-					retry.CheckRetryObjectEventually(key1, false, fakeOvn.controller.retryEgressNodes)
-					retry.CheckRetryObjectEventually(key2, false, fakeOvn.controller.retryEgressNodes)
 					i, n, _ := net.ParseCIDR(podV4IP + "/23")
 					n.IP = i
 					fakeOvn.controller.logicalPortCache.add(&egressPod, "", types.DefaultNetworkName, "", nil, []*net.IPNet{n})
@@ -4124,30 +4072,31 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 					_, err = fakeOvn.fakeClient.KubeClient.CoreV1().Pods(egressPod.Namespace).Update(context.TODO(), podUpdate, metav1.UpdateOptions{})
 					gomega.Expect(err).ToNot(gomega.HaveOccurred())
 					time.Sleep(config.Default.OVSDBTxnTimeout + time.Second)
-					// check to see if the retry cache has an entry
-					var key string
-					key, err = retry.GetResourceKey(podUpdate)
-					gomega.Expect(err).ToNot(gomega.HaveOccurred())
-					// no retry is expected if the pod is remote and the node isn't an egress node
-					if controllerNodeName == node1Name {
-						ginkgo.By("retry entry: new obj should not be nil, config should not be nil")
-						retry.CheckRetryObjectMultipleFieldsEventually(
-							key,
-							fakeOvn.controller.retryEgressIPPods,
-							gomega.BeNil(),             // oldObj should be nil
-							gomega.Not(gomega.BeNil()), // newObj should not be nil
-							gomega.Not(gomega.BeNil()), // config should not be nil
-						)
-					}
 
 					connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 					defer cancel()
 					resetNBClient(connCtx, fakeOvn.controller.nbClient)
 
-					retry.SetRetryObjWithNoBackoff(key, fakeOvn.controller.retryEgressIPPods)
-					fakeOvn.controller.retryEgressIPPods.RequestRetryObjs()
-					// check the cache no longer has the entry
-					retry.CheckRetryObjectEventually(key, false, fakeOvn.controller.retryEgressIPPods)
+					filtered := make([]libovsdbtest.TestData, 0, len(expectedDatabaseState))
+					for _, item := range expectedDatabaseState {
+						if _, ok := item.(*nbdb.LogicalRouterPolicy); ok {
+							continue
+						}
+						if _, ok := item.(*nbdb.NAT); ok {
+							continue
+						}
+						if lr, ok := item.(*nbdb.LogicalRouter); ok {
+							if lr.Name == types.OVNClusterRouter {
+								lr.Policies = []string{}
+							}
+							if lr.Name == types.GWRouterPrefix+node2Name {
+								lr.Nat = nil
+							}
+						}
+						filtered = append(filtered, item)
+					}
+					expectedDatabaseState = filtered
+					gomega.Eventually(fakeOvn.nbClient).Should(libovsdbtest.HaveData(expectedDatabaseState))
 
 					return nil
 				}
@@ -5103,20 +5052,9 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 
 					fakeOvn.patchEgressIPObj(node2Name, egressIPName, egressIP.String())
 
-					// sleep long enough for TransactWithRetry to fail, causing egressnode operations to fail
-					time.Sleep(config.Default.OVSDBTxnTimeout + time.Second)
-					// check to see if the retry cache has an entry
-					key, err := retry.GetResourceKey(&eIP)
-					gomega.Expect(err).NotTo(gomega.HaveOccurred())
-					retry.CheckRetryObjectEventually(key, true, fakeOvn.controller.retryEgressIPs)
-
 					connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 					defer cancel()
 					resetNBClient(connCtx, fakeOvn.controller.nbClient)
-					retry.SetRetryObjWithNoBackoff(key, fakeOvn.controller.retryEgressIPs)
-					fakeOvn.controller.retryEgressIPs.RequestRetryObjs()
-					// check the cache no longer has the entry
-					retry.CheckRetryObjectEventually(key, false, fakeOvn.controller.retryEgressIPs)
 
 					gomega.Eventually(getEgressIPStatusLen(eIP.Name)).Should(gomega.Equal(1))
 
@@ -6373,6 +6311,145 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 			ginkgo.Entry("when the namespace leaves the informer first", true),
 		)
 
+		ginkgo.It("ensures update-then-delete sequence removes OVN setup from last reconciled state", func() {
+			app.Action = func(*cli.Context) error {
+				egressIP := "192.168.126.25"
+				node1IPv4 := "192.168.126.12"
+				node1IPv4CIDR := node1IPv4 + "/24"
+				egressPod := *ovntest.NewPodWithLabels(eipNamespace, podName, node1Name, podV4IP, egressPodLabel)
+				egressNamespace := ovntest.NewNamespace(eipNamespace)
+				node1 := corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: node1Name,
+						Annotations: map[string]string{
+							"k8s.ovn.org/node-primary-ifaddr": fmt.Sprintf("{\"ipv4\": \"%s\"}", node1IPv4CIDR),
+							"k8s.ovn.org/node-subnets":        fmt.Sprintf("{\"default\":\"%s\"}", v4Node1Subnet),
+							"k8s.ovn.org/l3-gateway-config":   `{"default":{"mode":"local","mac-address":"7e:57:f8:f0:3c:49", "ip-address":"192.168.126.12/24", "next-hop":"192.168.126.1"}}`,
+							"k8s.ovn.org/node-chassis-id":     "79fdcfc4-6fe6-4cd3-8242-c0f85a4668ec",
+							util.OVNNodeHostCIDRs:             fmt.Sprintf("[\"%s\"]", node1IPv4CIDR),
+						},
+						Labels: map[string]string{
+							"k8s.ovn.org/egress-assignable": "",
+						},
+					},
+				}
+				eIP := egressipv1.EgressIP{
+					ObjectMeta: newEgressIPMeta(egressIPName),
+					Spec: egressipv1.EgressIPSpec{
+						EgressIPs: []string{egressIP},
+						NamespaceSelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"name": egressNamespace.Name,
+							},
+						},
+					},
+					Status: egressipv1.EgressIPStatus{
+						Items: []egressipv1.EgressIPStatusItem{
+							{
+								Node:     node1Name,
+								EgressIP: egressIP,
+							},
+						},
+					},
+				}
+				node1GR := &nbdb.LogicalRouter{
+					Name:  types.GWRouterPrefix + node1.Name,
+					UUID:  types.GWRouterPrefix + node1.Name + "-UUID",
+					Ports: []string{types.GWRouterToJoinSwitchPrefix + types.GWRouterPrefix + node1.Name + "-UUID"},
+				}
+				node1LSP := &nbdb.LogicalSwitchPort{
+					UUID: types.EXTSwitchToGWRouterPrefix + types.GWRouterPrefix + node1Name + "-UUID",
+					Name: types.EXTSwitchToGWRouterPrefix + types.GWRouterPrefix + node1Name,
+					Type: "router",
+					Options: map[string]string{
+						libovsdbops.RouterPort:      types.GWRouterToExtSwitchPrefix + "GR_" + node1Name,
+						"nat-addresses":             "router",
+						"exclude-lb-vips-from-garp": "true",
+					},
+				}
+				_, node1Subnet, _ := net.ParseCIDR(v4Node1Subnet)
+				fakeOvn.startWithDBSetup(
+					libovsdbtest.TestSetup{
+						NBData: []libovsdbtest.TestData{
+							&nbdb.LogicalRouter{
+								Name: types.OVNClusterRouter,
+								UUID: types.OVNClusterRouter + "-UUID",
+							},
+							node1GR,
+							node1LSP,
+							&nbdb.LogicalRouterPort{
+								UUID:     types.GWRouterToJoinSwitchPrefix + types.GWRouterPrefix + node1.Name + "-UUID",
+								Name:     types.GWRouterToJoinSwitchPrefix + types.GWRouterPrefix + node1.Name,
+								Networks: []string{nodeLogicalRouterIfAddrV4},
+							},
+							&nbdb.LogicalSwitchPort{
+								UUID:      "k8s-" + node1Name + "-UUID",
+								Name:      "k8s-" + node1Name,
+								Addresses: []string{"fe:1a:b2:3f:0e:fb " + util.GetNodeManagementIfAddr(node1Subnet).IP.String()},
+							},
+							&nbdb.LogicalSwitch{
+								UUID:  node1Name + "-UUID",
+								Name:  node1Name,
+								Ports: []string{"k8s-" + node1Name + "-UUID"},
+							},
+							&nbdb.LogicalSwitch{
+								UUID:  types.ExternalSwitchPrefix + node1Name + "-UUID",
+								Name:  types.ExternalSwitchPrefix + node1Name,
+								Ports: []string{types.EXTSwitchToGWRouterPrefix + types.GWRouterPrefix + node1Name + "-UUID"},
+							},
+						},
+					},
+					&egressipv1.EgressIPList{
+						Items: []egressipv1.EgressIP{eIP},
+					},
+					&corev1.NodeList{
+						Items: []corev1.Node{node1},
+					},
+					&corev1.NamespaceList{
+						Items: []corev1.Namespace{*egressNamespace},
+					},
+					&corev1.PodList{
+						Items: []corev1.Pod{egressPod},
+					},
+				)
+				i, n, _ := net.ParseCIDR(podV4IP + "/23")
+				n.IP = i
+				fakeOvn.controller.logicalPortCache.add(&egressPod, "", types.DefaultNetworkName, "", nil, []*net.IPNet{n})
+				gomega.Expect(fakeOvn.controller.WatchEgressIPPods()).To(gomega.Succeed())
+				gomega.Expect(fakeOvn.controller.WatchEgressIPNamespaces()).To(gomega.Succeed())
+				gomega.Expect(fakeOvn.controller.WatchEgressNodes()).To(gomega.Succeed())
+				gomega.Expect(fakeOvn.controller.WatchEgressIP()).To(gomega.Succeed())
+
+				// Verify NAT rule is created on node1
+				gomega.Eventually(func() bool {
+					var nats []*nbdb.NAT
+					err := fakeOvn.nbClient.WhereCache(func(nat *nbdb.NAT) bool {
+						return nat.LogicalIP == podV4IP
+					}).List(context.Background(), &nats)
+					return err == nil && len(nats) == 1
+				}).Should(gomega.BeTrue())
+
+				// Patch the EgressIP object with node2 in status, and then immediately delete it in API server
+				fakeOvn.patchEgressIPObj(node2Name, egressIPName, egressIP)
+				err := fakeOvn.fakeClient.EgressIPClient.K8sV1().EgressIPs().Delete(context.TODO(), eIP.Name, metav1.DeleteOptions{})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+				// Verify the NAT rule on node1 was cleanly removed, not orphaned
+				gomega.Eventually(func() int {
+					var nats []*nbdb.NAT
+					err := fakeOvn.nbClient.WhereCache(func(nat *nbdb.NAT) bool {
+						return nat.LogicalIP == podV4IP
+					}).List(context.Background(), &nats)
+					if err != nil {
+						return -1
+					}
+					return len(nats)
+				}).Should(gomega.Equal(0))
+				return nil
+			}
+			gomega.Expect(app.Run([]string{app.Name})).To(gomega.Succeed())
+		})
+
 	})
 	ginkgo.Context("on invalid EgressIP selectors", func() {
 		ginkgo.It("reconcileEgressIP should return an error", func() {
@@ -6416,16 +6493,11 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 				}, &corev1.NodeList{Items: []corev1.Node{node}})
 				gomega.Expect(fakeOvn.controller.eIPC.initClusterEgressPolicies(nil)).To(gomega.Succeed())
 
-				fakeOvn.controller.syncEIPNodeRerouteFailed.Store(node.Name, true)
-				handler := &defaultNetworkControllerEventHandler{
-					objType: factory.EgressNodeType,
-					oc:      fakeOvn.controller,
-				}
 				if update {
-					gomega.Expect(handler.UpdateResource(&node, &node, true)).To(gomega.Succeed())
-				} else {
-					gomega.Expect(handler.AddResource(&node, true)).To(gomega.Succeed())
+					_, err := fakeOvn.fakeClient.KubeClient.CoreV1().Nodes().Update(context.TODO(), &node, metav1.UpdateOptions{})
+					gomega.Expect(err).NotTo(gomega.HaveOccurred())
 				}
+				gomega.Expect(fakeOvn.controller.eIPC.reconcileNode(node.Name)).To(gomega.Succeed())
 
 				var routes []nbdb.LogicalRouterStaticRoute
 				err := fakeOvn.nbClient.WhereCache(func(route *nbdb.LogicalRouterStaticRoute) bool {
@@ -6442,6 +6514,96 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 			ginkgo.Entry("during an add retry", false),
 			ginkgo.Entry("during an update", true),
 		)
+		ginkgo.It("reconciles egress node replacement when UID changes and preserves nodeState", func() {
+			app.Action = func(*cli.Context) error {
+				node := getNodeObj(node1Name, map[string]string{util.OvnNodeID: "1"}, nil)
+				node.UID = k8stypes.UID("old-uid-1234")
+				fakeOvn.startWithDBSetup(libovsdbtest.TestSetup{
+					NBData: []libovsdbtest.TestData{
+						&nbdb.LogicalRouter{
+							Name: types.OVNClusterRouter,
+							UUID: types.OVNClusterRouter + "-UUID",
+						},
+						&nbdb.LogicalSwitch{
+							Name: node1Name,
+							UUID: node1Name + "-UUID",
+						},
+					},
+				}, &corev1.NodeList{Items: []corev1.Node{node}})
+				gomega.Expect(fakeOvn.controller.eIPC.initClusterEgressPolicies(nil)).To(gomega.Succeed())
+
+				// Seed the cache with the old node UID
+				fakeOvn.controller.eIPC.egressNodeCache.Store(node.Name, node.DeepCopy())
+
+				// Now update node in API server with a new UID (recreated node with same name)
+				newNode := node.DeepCopy()
+				newNode.UID = k8stypes.UID("new-uid-5678")
+				_, err := fakeOvn.fakeClient.KubeClient.CoreV1().Nodes().Update(context.TODO(), newNode, metav1.UpdateOptions{})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+				// Reconcile node with changed UID
+				gomega.Expect(fakeOvn.controller.eIPC.reconcileNode(newNode.Name)).To(gomega.Succeed())
+
+				// Verify nodeState still holds the node
+				_, loaded := fakeOvn.controller.eIPC.nodeState.Load(newNode.Name)
+				gomega.Expect(loaded).To(gomega.BeTrue())
+				return nil
+			}
+
+			gomega.Expect(app.Run([]string{app.Name})).To(gomega.Succeed())
+		})
+		ginkgo.It("retries addEgressNode via workqueue when startup add fails due to missing annotations", func() {
+			app.Action = func(*cli.Context) error {
+				// Node without node-id annotation at startup
+				node := getNodeObj(node1Name, nil, nil)
+				fakeOvn.startWithDBSetup(libovsdbtest.TestSetup{
+					NBData: []libovsdbtest.TestData{
+						&nbdb.LogicalRouter{
+							Name: types.OVNClusterRouter,
+							UUID: types.OVNClusterRouter + "-UUID",
+						},
+						&nbdb.LogicalSwitch{
+							Name: node1Name,
+							UUID: node1Name + "-UUID",
+						},
+					},
+				}, &corev1.NodeList{Items: []corev1.Node{node}})
+
+				// WatchEgressNodes runs initial sync where addEgressNode fails and enqueues node1
+				gomega.Expect(fakeOvn.controller.WatchEgressNodes()).To(gomega.Succeed())
+
+				// Verify static route is NOT yet present
+				var routes []nbdb.LogicalRouterStaticRoute
+				err := fakeOvn.nbClient.WhereCache(func(route *nbdb.LogicalRouterStaticRoute) bool {
+					return route.IPPrefix == v4ClusterSubnet &&
+						route.Policy != nil && *route.Policy == nbdb.LogicalRouterStaticRoutePolicySrcIP
+				}).List(context.Background(), &routes)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(routes).To(gomega.BeEmpty())
+
+				// Now node gets annotated with node-id
+				nodeWithID := getNodeObj(node1Name, map[string]string{util.OvnNodeID: "1"}, nil)
+				_, err = fakeOvn.fakeClient.KubeClient.CoreV1().Nodes().Update(context.TODO(), &nodeWithID, metav1.UpdateOptions{})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+				// Worker should process the retry and successfully add the static route
+				gomega.Eventually(func() int {
+					var rts []nbdb.LogicalRouterStaticRoute
+					err := fakeOvn.nbClient.WhereCache(func(route *nbdb.LogicalRouterStaticRoute) bool {
+						return route.IPPrefix == v4ClusterSubnet &&
+							route.Policy != nil && *route.Policy == nbdb.LogicalRouterStaticRoutePolicySrcIP
+					}).List(context.Background(), &rts)
+					if err != nil {
+						return -1
+					}
+					return len(rts)
+				}).Should(gomega.Equal(1))
+
+				return nil
+			}
+
+			gomega.Expect(app.Run([]string{app.Name})).To(gomega.Succeed())
+		})
 		ginkgo.It("should populated egress node data as they are tagged `egress assignable` with variants of IPv4/IPv6", func() {
 			app.Action = func(*cli.Context) error {
 				config.IPv6Mode = true
@@ -6742,32 +6904,12 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 					return fakeOvn.controller.nbClient.Connected()
 				}).Should(gomega.BeFalse())
 
-				// sleep long enough for TransactWithRetry to fail, causing egressnode operations to fail
-				// there is a chance that both egressnode events(node1 removal and node2 update) will end up in the same event queue
-				// sleep for double the time to allow for two consecutive TransactWithRetry timeouts
-				time.Sleep(2 * (config.Default.OVSDBTxnTimeout + time.Second))
-				// check to see if the retry cache has an entry
-				key, err := retry.GetResourceKey(&node)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				retry.CheckRetryObjectEventually(key, true, fakeOvn.controller.retryEgressNodes)
-				ginkgo.By("retry entry: old obj should be nil, new obj should not be nil")
-				retry.CheckRetryObjectMultipleFieldsEventually(
-					key,
-					fakeOvn.controller.retryEgressNodes,
-					gomega.BeNil(),             // oldObj should be nil
-					gomega.Not(gomega.BeNil()), // newObj should not be nil
-				)
-
 				node.Labels = map[string]string{}
 				_, err = fakeOvn.fakeClient.KubeClient.CoreV1().Nodes().Update(context.TODO(), &node, metav1.UpdateOptions{})
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 				connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 				defer cancel()
 				resetNBClient(connCtx, fakeOvn.controller.nbClient)
-				retry.SetRetryObjWithNoBackoff(key, fakeOvn.controller.retryEgressNodes)
-				fakeOvn.controller.retryEgressNodes.RequestRetryObjs()
-				// check the cache no longer has the entry
-				retry.CheckRetryObjectEventually(key, false, fakeOvn.controller.retryEgressNodes)
 
 				expectedDatabaseState := []libovsdbtest.TestData{
 					&nbdb.LogicalRouter{
@@ -11597,11 +11739,12 @@ var _ = ginkgo.Describe("OVN EgressIP Operations cluster default network", func(
 					}
 					node1 := getNodeObj(node1Name, annotations, map[string]string{})
 					annotations = map[string]string{
-						"k8s.ovn.org/node-primary-ifaddr": fmt.Sprintf("{\"ipv4\": \"%s\"}", node2IPv4CIDR),
-						"k8s.ovn.org/node-subnets":        fmt.Sprintf("{\"default\":\"%s\"}", v4Node2Subnet),
-						"k8s.ovn.org/l3-gateway-config":   `{"default":{"mode":"local","mac-address":"7e:57:f8:f0:3c:49", "ip-address":"192.168.126.51/24", "next-hop":"192.168.126.1"}}`,
-						"k8s.ovn.org/node-chassis-id":     "89fdcfc4-6fe6-4cd3-8242-c0f85a4668ec",
-						util.OVNNodeHostCIDRs:             fmt.Sprintf("[\"%s\"]", node2IPv4CIDR),
+						"k8s.ovn.org/node-primary-ifaddr":             fmt.Sprintf("{\"ipv4\": \"%s\"}", node2IPv4CIDR),
+						"k8s.ovn.org/node-subnets":                    fmt.Sprintf("{\"default\":\"%s\"}", v4Node2Subnet),
+						"k8s.ovn.org/l3-gateway-config":               `{"default":{"mode":"local","mac-address":"7e:57:f8:f0:3c:49", "ip-address":"192.168.126.51/24", "next-hop":"192.168.126.1"}}`,
+						"k8s.ovn.org/node-chassis-id":                 "89fdcfc4-6fe6-4cd3-8242-c0f85a4668ec",
+						"k8s.ovn.org/node-transit-switch-port-ifaddr": "{\"ipv4\":\"100.88.0.3/16\"}",
+						util.OVNNodeHostCIDRs:                         fmt.Sprintf("[\"%s\"]", node2IPv4CIDR),
 					}
 					node2 := getNodeObj(node2Name, annotations, map[string]string{})
 

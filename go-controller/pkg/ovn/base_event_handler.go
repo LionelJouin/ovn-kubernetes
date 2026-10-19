@@ -30,10 +30,6 @@ func hasResourceAnUpdateFunc(objType reflect.Type) bool {
 	switch objType {
 	case factory.PodType,
 		factory.NodeType,
-		factory.EgressIPType,
-		factory.EgressIPNamespaceType,
-		factory.EgressIPPodType,
-		factory.EgressNodeType,
 		factory.NamespaceType,
 		factory.MultiNetworkPolicyType:
 		return true
@@ -74,8 +70,7 @@ func (h *baseNetworkControllerEventHandler) areResourcesEqual(objType reflect.Ty
 		// when shouldUpdateNode is false, the hostsubnet is not assigned by ovn-kubernetes
 		return !shouldUpdateNode(node2, node1), nil
 
-	case factory.PodType,
-		factory.EgressIPPodType:
+	case factory.PodType:
 		// For these types, there was no old vs new obj comparison in the original update code,
 		// so pretend they're always different so that the update code gets executed
 		return false, nil
@@ -90,12 +85,6 @@ func (h *baseNetworkControllerEventHandler) areResourcesEqual(objType reflect.Ty
 			return false, fmt.Errorf("could not cast obj2 of type %T to *egressfirewall.EgressFirewall", obj2)
 		}
 		return reflect.DeepEqual(oldEgressFirewall.Spec, newEgressFirewall.Spec), nil
-
-	case factory.EgressIPType,
-		factory.EgressIPNamespaceType,
-		factory.EgressNodeType:
-		// force update path for EgressIP resource.
-		return false, nil
 
 	case factory.NamespaceType:
 		// force update path for Namespace resource.
@@ -136,23 +125,17 @@ func (h *baseNetworkControllerEventHandler) getResourceFromInformerCache(objType
 	case factory.PolicyType:
 		obj, err = watchFactory.GetNetworkPolicy(namespace, name)
 
-	case factory.NodeType,
-		factory.EgressNodeType:
+	case factory.NodeType:
 		obj, err = watchFactory.GetNode(name)
 
-	case factory.PodType,
-		factory.EgressIPPodType:
+	case factory.PodType:
 		obj, err = watchFactory.GetPod(namespace, name)
 
-	case factory.EgressIPNamespaceType,
-		factory.NamespaceType:
+	case factory.NamespaceType:
 		obj, err = watchFactory.GetNamespace(name)
 
 	case factory.EgressFirewallType:
 		obj, err = watchFactory.GetEgressFirewall(namespace, name)
-
-	case factory.EgressIPType:
-		obj, err = watchFactory.GetEgressIP(name)
 
 	case factory.MultiNetworkPolicyType:
 		obj, err = watchFactory.GetMultiNetworkPolicy(namespace, name)
@@ -178,11 +161,7 @@ func (h *baseNetworkControllerEventHandler) isResourceScheduled(objType reflect.
 // Given an object type, resourceNeedsUpdate returns true if the object needs to invoke update during iterate retry.
 func needsUpdateDuringRetry(objType reflect.Type) bool {
 	switch objType {
-	case factory.EgressNodeType,
-		factory.EgressIPType,
-		factory.EgressIPPodType,
-		factory.EgressIPNamespaceType,
-		factory.MultiNetworkPolicyType:
+	case factory.MultiNetworkPolicyType:
 		return true
 	}
 	return false
@@ -191,8 +170,7 @@ func needsUpdateDuringRetry(objType reflect.Type) bool {
 // IsObjectInTerminalState returns true if the object is in a terminal state.
 func (h *baseNetworkControllerEventHandler) isObjectInTerminalState(objType reflect.Type, obj interface{}) bool {
 	switch objType {
-	case factory.PodType,
-		factory.EgressIPPodType:
+	case factory.PodType:
 		pod := obj.(*corev1.Pod)
 		return util.PodCompleted(pod)
 
