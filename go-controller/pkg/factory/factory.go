@@ -32,6 +32,7 @@ import (
 	ocpcloudnetworkapi "github.com/openshift/api/cloudnetwork/v1"
 	ocpnetworkapiv1alpha1 "github.com/openshift/api/network/v1alpha1"
 	ocpcloudnetworkinformerfactory "github.com/openshift/client-go/cloudnetwork/informers/externalversions"
+	ocpcloudnetworkinformer "github.com/openshift/client-go/cloudnetwork/informers/externalversions/cloudnetwork/v1"
 	ocpcloudnetworklister "github.com/openshift/client-go/cloudnetwork/listers/cloudnetwork/v1"
 	ocpnetworkscheme "github.com/openshift/client-go/network/clientset/versioned/scheme"
 	ocpnetworkinformerfactory "github.com/openshift/client-go/network/informers/externalversions"
@@ -1764,6 +1765,11 @@ func (wf *WatchFactory) GetCloudPrivateIPConfig(name string) (*ocpcloudnetworkap
 	return cloudPrivateIPConfigLister.Get(name)
 }
 
+func (wf *WatchFactory) GetCloudPrivateIPConfigs() ([]*ocpcloudnetworkapi.CloudPrivateIPConfig, error) {
+	cloudPrivateIPConfigLister := wf.informers[CloudPrivateIPConfigType].lister.(ocpcloudnetworklister.CloudPrivateIPConfigLister)
+	return cloudPrivateIPConfigLister.List(labels.Everything())
+}
+
 func (wf *WatchFactory) GetEgressIP(name string) (*egressipapi.EgressIP, error) {
 	egressIPLister := wf.informers[EgressIPType].lister.(egressiplister.EgressIPLister)
 	return egressIPLister.Get(name)
@@ -1916,6 +1922,10 @@ func (wf *WatchFactory) ANPInformer() anpinformer.AdminNetworkPolicyInformer {
 
 func (wf *WatchFactory) BANPInformer() anpinformer.BaselineAdminNetworkPolicyInformer {
 	return wf.anpFactory.Policy().V1alpha1().BaselineAdminNetworkPolicies()
+}
+
+func (wf *WatchFactory) CloudPrivateIPConfigInformer() ocpcloudnetworkinformer.CloudPrivateIPConfigInformer {
+	return wf.cpipcFactory.Cloud().V1().CloudPrivateIPConfigs()
 }
 
 func (wf *WatchFactory) EgressIPInformer() egressipinformer.EgressIPInformer {

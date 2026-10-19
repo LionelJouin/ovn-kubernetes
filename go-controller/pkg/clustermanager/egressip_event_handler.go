@@ -10,26 +10,18 @@ import (
 	ocpcloudnetworkapi "github.com/openshift/api/cloudnetwork/v1"
 
 	corev1 "k8s.io/api/core/v1"
-	cache "k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
-	objretry "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
 
 // egressIPClusterControllerEventHandler object handles the events
-// from retry framework for the egressIPClusterController.
+// for the egressIPClusterController.
 type egressIPClusterControllerEventHandler struct {
-	objretry.DefaultEventHandler
-	objType  reflect.Type
-	eIPC     *egressIPClusterController
-	syncFunc func([]interface{}) error
-}
-
-func (h *egressIPClusterControllerEventHandler) FilterOutResource(_ interface{}) bool {
-	return false
+	objType reflect.Type
+	eIPC    *egressIPClusterController
 }
 
 // egressIPClusterControllerEventHandler functions
@@ -260,56 +252,4 @@ func (h *egressIPClusterControllerEventHandler) DeleteResource(obj, _ interface{
 	default:
 		return fmt.Errorf("no delete function for object type %s", h.objType)
 	}
-}
-
-func (h *egressIPClusterControllerEventHandler) SyncFunc(objs []interface{}) error {
-	var syncFunc func([]interface{}) error
-
-	if h.syncFunc != nil {
-		// syncFunc was provided explicitly
-		syncFunc = h.syncFunc
-	} else {
-		switch h.objType {
-		case factory.EgressIPType:
-			syncFunc = h.eIPC.syncEgressIPMarkAllocator
-		case factory.EgressNodeType:
-			syncFunc = h.eIPC.initEgressNodeReachability
-		case factory.CloudPrivateIPConfigType:
-			syncFunc = h.eIPC.syncCloudPrivateIPConfigs
-
-		default:
-			return fmt.Errorf("no sync function for object type %s", h.objType)
-		}
-	}
-	if syncFunc == nil {
-		return nil
-	}
-	return syncFunc(objs)
-}
-
-// getResourceFromInformerCache returns the latest state of the object from the informers cache
-// given an object key and its type
-func (h *egressIPClusterControllerEventHandler) GetResourceFromInformerCache(key string) (interface{}, error) {
-	var obj interface{}
-	var name string
-	var err error
-
-	_, name, err = cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to split key %s: %v", key, err)
-	}
-
-	switch h.objType {
-	case factory.EgressNodeType:
-		obj, err = h.eIPC.watchFactory.GetNode(name)
-	case factory.CloudPrivateIPConfigType:
-		obj, err = h.eIPC.watchFactory.GetCloudPrivateIPConfig(name)
-	case factory.EgressIPType:
-		obj, err = h.eIPC.watchFactory.GetEgressIP(name)
-
-	default:
-		err = fmt.Errorf("object type %s not supported, cannot retrieve it from informers cache",
-			h.objType)
-	}
-	return obj, err
 }
