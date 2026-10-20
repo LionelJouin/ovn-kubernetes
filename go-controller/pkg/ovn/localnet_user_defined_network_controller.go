@@ -135,9 +135,6 @@ func (h *LocalnetUserDefinedNetworkControllerEventHandler) SyncFunc(objs []inter
 		case factory.PodType:
 			syncFunc = h.oc.syncPodsForUserDefinedNetwork
 
-		case factory.NamespaceType:
-			syncFunc = h.oc.syncNamespaces
-
 		case factory.MultiNetworkPolicyType:
 			syncFunc = h.oc.syncMultiNetworkPolicies
 
@@ -219,6 +216,9 @@ func NewLocalnetUserDefinedNetworkController(
 	oc.multicastSupport = false
 
 	oc.initRetryFramework()
+	if err := oc.initNamespaceHandlers(); err != nil {
+		klog.Errorf("Failed to initialize namespace handlers for localnet network %s: %v", oc.GetNetworkName(), err)
+	}
 	return oc
 }
 
@@ -300,7 +300,6 @@ func (oc *LocalnetUserDefinedNetworkController) initRetryFramework() {
 	// multi-network policy support is not enabled. We don't support
 	// multi-network policy for IPAM-less secondary networks either.
 	if util.IsMultiNetworkPoliciesSupportEnabled() {
-		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 		oc.retryMultiNetworkPolicies = oc.newRetryFramework(factory.MultiNetworkPolicyType)
 	}
 }

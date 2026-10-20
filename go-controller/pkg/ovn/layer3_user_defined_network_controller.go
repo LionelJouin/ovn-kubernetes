@@ -141,9 +141,6 @@ func (h *Layer3UserDefinedNetworkControllerEventHandler) SyncFunc(objs []interfa
 		case factory.PodType:
 			syncFunc = h.oc.syncPodsForUserDefinedNetwork
 
-		case factory.NamespaceType:
-			syncFunc = h.oc.syncNamespaces
-
 		case factory.PolicyType:
 			syncFunc = h.oc.syncNetworkPolicies
 
@@ -288,6 +285,9 @@ func NewLayer3UserDefinedNetworkController(
 	oc.multicastSupport = oc.IsPrimaryNetwork() && util.IsNetworkSegmentationSupportEnabled() && config.EnableMulticast
 
 	oc.initRetryFramework()
+	if err := oc.initNamespaceHandlers(); err != nil {
+		return nil, err
+	}
 	return oc, nil
 }
 
@@ -297,7 +297,6 @@ func (oc *Layer3UserDefinedNetworkController) initRetryFramework() {
 	// When a user-defined network is enabled as a primary network for namespace,
 	// then watch for namespace and network policy events.
 	if oc.IsPrimaryNetwork() {
-		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 		oc.retryNetworkPolicies = oc.newRetryFramework(factory.PolicyType)
 	}
 
@@ -305,7 +304,6 @@ func (oc *Layer3UserDefinedNetworkController) initRetryFramework() {
 	// multi-network policy support is not enabled. We don't support
 	// multi-network policy for IPAM-less secondary networks either.
 	if util.IsMultiNetworkPoliciesSupportEnabled() {
-		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 		oc.retryMultiNetworkPolicies = oc.newRetryFramework(factory.MultiNetworkPolicyType)
 	}
 }
@@ -361,6 +359,7 @@ func (oc *Layer3UserDefinedNetworkController) Stop() {
 	klog.Infof("Stop %s UDN controller of network %s", oc.TopologyType(), oc.GetNetworkName())
 	oc.DeregisterServiceNetwork()
 	oc.DeregisterNodeHandler()
+	oc.StopNamespaces()
 	close(oc.stopChan)
 	oc.stopChan = nil
 	oc.cancelableCtx.Cancel()
@@ -374,9 +373,6 @@ func (oc *Layer3UserDefinedNetworkController) Stop() {
 	}
 	if oc.podHandler != nil {
 		oc.watchFactory.RemovePodHandler(oc.podHandler)
-	}
-	if oc.namespaceHandler != nil {
-		oc.watchFactory.RemoveNamespaceHandler(oc.namespaceHandler)
 	}
 	if oc.routeImportManager != nil {
 		oc.routeImportManager.ForgetNetwork(oc.GetNetworkName())

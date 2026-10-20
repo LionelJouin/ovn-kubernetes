@@ -70,13 +70,6 @@ func (bsnc *BaseUserDefinedNetworkController) AddUserDefinedNetworkResourceCommo
 		}
 		return bsnc.ensurePodForUserDefinedNetwork(pod, true)
 
-	case factory.NamespaceType:
-		ns, ok := obj.(*corev1.Namespace)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *kapi.Namespace", obj)
-		}
-		return bsnc.AddNamespaceForUserDefinedNetwork(ns)
-
 	case factory.MultiNetworkPolicyType:
 		mp, ok := obj.(*mnpapi.MultiNetworkPolicy)
 		if !ok {
@@ -117,10 +110,6 @@ func (bsnc *BaseUserDefinedNetworkController) UpdateUserDefinedNetworkResourceCo
 		addPort := shouldAddPort(oldPod, newPod, inRetryCache) ||
 			bsnc.dhcpPodNetworkUpdated(oldPod, newPod)
 		return bsnc.ensurePodForUserDefinedNetwork(newPod, addPort)
-
-	case factory.NamespaceType:
-		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
-		return bsnc.updateNamespaceForUserDefinedNetwork(oldNs, newNs)
 
 	case factory.MultiNetworkPolicyType:
 		oldMp, ok := oldObj.(*mnpapi.MultiNetworkPolicy)
@@ -179,10 +168,6 @@ func (bsnc *BaseUserDefinedNetworkController) DeleteUserDefinedNetworkResourceCo
 			portInfoMap = cachedObj.(map[string]*lpInfo)
 		}
 		return bsnc.removePodForUserDefinedNetwork(pod, portInfoMap)
-
-	case factory.NamespaceType:
-		ns := obj.(*corev1.Namespace)
-		return bsnc.deleteNamespaceForUserDefinedNetwork(ns)
 
 	case factory.MultiNetworkPolicyType:
 		mp, ok := obj.(*mnpapi.MultiNetworkPolicy)
@@ -609,70 +594,22 @@ func (bsnc *BaseUserDefinedNetworkController) syncPodsForUserDefinedNetwork(pods
 
 // AddNamespaceForUserDefinedNetwork creates corresponding addressset in ovn db for User Defined Network
 func (bsnc *BaseUserDefinedNetworkController) AddNamespaceForUserDefinedNetwork(ns *corev1.Namespace) error {
-	klog.Infof("[%s] adding namespace for network %s", ns.Name, bsnc.GetNetworkName())
-	// Keep track of how long syncs take.
-	start := time.Now()
-	defer func() {
-		klog.Infof("[%s] adding namespace took %v for network %s", ns.Name, time.Since(start), bsnc.GetNetworkName())
-	}()
-
-	_, nsUnlock, err := bsnc.ensureNamespaceLockedForUserDefinedNetwork(ns.Name, false, ns)
-	if err != nil {
-		return fmt.Errorf("failed to ensure namespace locked: %v", err)
-	}
-	nsUnlock()
-	return nil
+	return bsnc.AddNamespace(ns)
 }
 
 // ensureNamespaceLockedForUserDefinedNetwork locks namespacesMutex, gets/creates an entry for ns, configures OVN nsInfo,
 // and returns it with its mutex locked.
 // ns is the name of the namespace, while namespace is the optional k8s namespace object
 func (bsnc *BaseUserDefinedNetworkController) ensureNamespaceLockedForUserDefinedNetwork(ns string, readOnly bool, namespace *corev1.Namespace) (*namespaceInfo, func(), error) {
-	return bsnc.ensureNamespaceLockedCommon(ns, readOnly, namespace, bsnc.configureNamespaceCommon)
+	return bsnc.ensureNamespaceLocked(ns, readOnly, namespace)
 }
 
-func (bsnc *BaseUserDefinedNetworkController) updateNamespaceForUserDefinedNetwork(old, newer *corev1.Namespace) error {
-	var errors []error
-	klog.Infof("[%s] updating namespace for network %s", old.Name, bsnc.GetNetworkName())
-
-	nsInfo, nsUnlock := bsnc.getNamespaceLocked(old.Name, false)
-	if nsInfo == nil {
-		klog.Warningf("Update event for unknown namespace %q", old.Name)
-		return nil
-	}
-	defer nsUnlock()
-
-	aclAnnotation := newer.Annotations[util.AclLoggingAnnotation]
-	oldACLAnnotation := old.Annotations[util.AclLoggingAnnotation]
-	// support for ACL logging update, if new annotation is empty, make sure we propagate new setting
-	if aclAnnotation != oldACLAnnotation {
-		if err := bsnc.updateNamespaceAclLogging(old.Name, aclAnnotation, nsInfo); err != nil {
-			errors = append(errors, err)
-		}
-	}
-
-	if err := bsnc.multicastUpdateNamespace(newer, nsInfo); err != nil {
-		errors = append(errors, err)
-	}
-	return utilerrors.Join(errors...)
+func (bsnc *BaseUserDefinedNetworkController) updateNamespaceForUserDefinedNetwork(_, newer *corev1.Namespace) error {
+	return bsnc.AddNamespace(newer)
 }
 
 func (bsnc *BaseUserDefinedNetworkController) deleteNamespaceForUserDefinedNetwork(ns *corev1.Namespace) error {
-	klog.Infof("[%s] deleting namespace for network %s", ns.Name, bsnc.GetNetworkName())
-
-	nsInfo, err := bsnc.deleteNamespaceLocked(ns.Name)
-	if err != nil {
-		return err
-	}
-	if nsInfo == nil {
-		return nil
-	}
-	defer nsInfo.Unlock()
-
-	if err := bsnc.multicastDeleteNamespace(ns, nsInfo); err != nil {
-		return fmt.Errorf("failed to delete multicast namespace error %v", err)
-	}
-	return nil
+	return bsnc.deleteNamespace(ns)
 }
 
 // WatchNetworkPolicy starts the watching of networkpolicy resource and calls

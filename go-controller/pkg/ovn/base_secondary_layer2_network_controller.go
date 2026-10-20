@@ -34,6 +34,7 @@ func (oc *BaseLayer2UserDefinedNetworkController) stop() {
 		return
 	}
 	klog.Infof("Stop secondary %s network controller of network %s", oc.TopologyType(), oc.GetNetworkName())
+	oc.StopNamespaces()
 	close(oc.stopChan)
 	oc.stopChan = nil
 	oc.cancelableCtx.Cancel()
@@ -47,9 +48,6 @@ func (oc *BaseLayer2UserDefinedNetworkController) stop() {
 	}
 	if oc.podHandler != nil {
 		oc.watchFactory.RemovePodHandler(oc.podHandler)
-	}
-	if oc.namespaceHandler != nil {
-		oc.watchFactory.RemoveNamespaceHandler(oc.namespaceHandler)
 	}
 	if oc.routeImportManager != nil && config.Gateway.Mode == config.GatewayModeShared {
 		oc.routeImportManager.ForgetNetwork(oc.GetNetworkName())

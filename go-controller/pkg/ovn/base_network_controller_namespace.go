@@ -7,14 +7,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
@@ -62,24 +70,243 @@ func (bnc *BaseNetworkController) shouldWatchNamespaces() bool {
 		bnc.IsUserDefinedNetwork() && util.IsMultiNetworkPoliciesSupportEnabled()
 }
 
-// WatchNamespaces starts the watching of namespace resource and calls
-// back the appropriate handler logic
+// initNamespaceHandlers initializes the rate-limiting workqueue and event handlers for namespaces.
+func (bnc *BaseNetworkController) initNamespaceHandlers() error {
+	if !bnc.shouldWatchNamespaces() {
+		return nil
+	}
+
+	if bnc.namespaceQueue != nil || bnc.watchFactory == nil {
+		return nil
+	}
+
+	bnc.namespaceQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: fmt.Sprintf("%s-namespaces", bnc.GetNetworkName())},
+	)
+
+	handler, err := bnc.watchFactory.NamespaceInformer().Informer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    bnc.onNamespaceAdd,
+			UpdateFunc: bnc.onNamespaceUpdate,
+			DeleteFunc: bnc.onNamespaceDelete,
+		}),
+	)
+	if err != nil {
+		bnc.StopNamespaces()
+		return fmt.Errorf("unable to add namespace handler: %w", err)
+	}
+	bnc.namespaceHandler = handler
+
+	return nil
+}
+
+// WatchNamespaces starts watching namespace resources and reconciles them via a rate-limiting workqueue.
 func (bnc *BaseNetworkController) WatchNamespaces() error {
 	if !bnc.shouldWatchNamespaces() {
 		klog.Infof("Ignoring namespaces events for network: %s", bnc.GetNetworkName())
 		return nil
 	}
 
-	if bnc.namespaceHandler != nil {
-		return nil
+	if bnc.namespaceQueue == nil {
+		return fmt.Errorf("namespaceQueue is not initialized")
 	}
 
-	handler, err := bnc.retryNamespaces.WatchResource()
+	runCtx := wait.ContextForChannel(bnc.stopChan)
+	if bnc.watchFactory != nil {
+		namespaces, err := bnc.watchFactory.GetNamespaces()
+		if err != nil {
+			return fmt.Errorf("failed to get namespaces for initial sync: %w", err)
+		}
+		nsObjs := make([]interface{}, len(namespaces))
+		for i, ns := range namespaces {
+			nsObjs[i] = ns
+		}
+		if err := bnc.syncNamespaces(nsObjs); err != nil {
+			return fmt.Errorf("failed to sync namespaces: %w", err)
+		}
+
+		for _, ns := range namespaces {
+			if bnc.shouldFilterNamespace(ns.Name) {
+				continue
+			}
+			if err := bnc.AddNamespace(ns); err != nil {
+				klog.Warningf("Failed to add namespace %s at startup: %v, will retry via queue", ns.Name, err)
+				bnc.namespaceQueue.AddRateLimited(ns.Name)
+			}
+		}
+	}
+
+	return bnc.WatchNamespacesWithWorkers(runCtx, 1)
+}
+
+func (bnc *BaseNetworkController) WatchNamespacesWithWorkers(ctx context.Context, workers int) error {
+	if bnc.namespaceQueue == nil {
+		return fmt.Errorf("namespaceQueue is not initialized")
+	}
+
+	go func() {
+		<-ctx.Done()
+		bnc.StopNamespaces()
+	}()
+
+	for i := 0; i < workers; i++ {
+		bnc.wg.Add(1)
+		go func() {
+			defer bnc.wg.Done()
+			wait.UntilWithContext(ctx, bnc.runNamespaceWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (bnc *BaseNetworkController) runNamespaceWorker(_ context.Context) {
+	for bnc.processNamespaceItem() {
+	}
+}
+
+// StopNamespaces shuts down the namespace queue and removes the event handler.
+func (bnc *BaseNetworkController) StopNamespaces() {
+	if bnc.namespaceQueue != nil {
+		bnc.namespaceQueue.ShutDown()
+	}
+	if bnc.namespaceHandler != nil && bnc.watchFactory != nil {
+		_ = bnc.watchFactory.NamespaceInformer().Informer().RemoveEventHandler(bnc.namespaceHandler)
+		bnc.namespaceHandler = nil
+	}
+}
+
+func (bnc *BaseNetworkController) onNamespaceAdd(obj interface{}) {
+	ns, ok := obj.(*corev1.Namespace)
+	if !ok {
+		return
+	}
+	if bnc.shouldFilterNamespace(ns.Name) {
+		return
+	}
+	bnc.namespaceQueue.Add(ns.Name)
+}
+
+func (bnc *BaseNetworkController) onNamespaceUpdate(oldObj, newObj interface{}) {
+	oldNs, ok1 := oldObj.(*corev1.Namespace)
+	newNs, ok2 := newObj.(*corev1.Namespace)
+	if !ok1 || !ok2 {
+		return
+	}
+	if bnc.shouldFilterNamespace(newNs.Name) && bnc.shouldFilterNamespace(oldNs.Name) {
+		return
+	}
+	oldAcl := oldNs.Annotations[util.AclLoggingAnnotation]
+	newAcl := newNs.Annotations[util.AclLoggingAnnotation]
+	oldMc := oldNs.Annotations[util.NsMulticastAnnotation]
+	newMc := newNs.Annotations[util.NsMulticastAnnotation]
+	if oldAcl == newAcl && oldMc == newMc && reflect.DeepEqual(oldNs.Labels, newNs.Labels) {
+		return
+	}
+	bnc.namespaceQueue.Add(newNs.Name)
+}
+
+func (bnc *BaseNetworkController) onNamespaceDelete(obj interface{}) {
+	ns, ok := obj.(*corev1.Namespace)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		ns, ok = tombstone.Obj.(*corev1.Namespace)
+		if !ok {
+			return
+		}
+	}
+	if bnc.shouldFilterNamespace(ns.Name) {
+		return
+	}
+	bnc.namespaceQueue.Add(ns.Name)
+}
+
+func (bnc *BaseNetworkController) processNamespaceItem() bool {
+	key, shutdown := bnc.namespaceQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer bnc.namespaceQueue.Done(key)
+
+	err := bnc.reconcileNamespace(key)
+	if err != nil {
+		numRequeues := bnc.namespaceQueue.NumRequeues(key)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling namespace %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		} else {
+			klog.V(4).Infof("Error reconciling namespace %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		}
+		bnc.namespaceQueue.AddRateLimited(key)
+		return true
+	}
+	bnc.namespaceQueue.Forget(key)
+	return true
+}
+
+func (bnc *BaseNetworkController) reconcileNamespace(name string) error {
+	curNamespace, err := bnc.watchFactory.GetNamespace(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return bnc.deleteNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}})
+		}
+		return fmt.Errorf("failed to get namespace %s: %w", name, err)
+	}
+
+	if bnc.shouldFilterNamespace(curNamespace.Name) {
+		return bnc.deleteNamespace(curNamespace)
+	}
+
+	return bnc.AddNamespace(curNamespace)
+}
+
+// AddNamespace creates corresponding logical entities in OVN DB for the namespace.
+func (bnc *BaseNetworkController) AddNamespace(ns *corev1.Namespace) error {
+	klog.Infof("[%s] reconciling namespace for network %s", ns.Name, bnc.GetNetworkName())
+	start := time.Now()
+	defer func() {
+		klog.Infof("[%s] reconciling namespace took %v for network %s", ns.Name, time.Since(start), bnc.GetNetworkName())
+	}()
+
+	_, nsUnlock, err := bnc.ensureNamespaceLocked(ns.Name, false, ns)
+	if err != nil {
+		return fmt.Errorf("failed to ensure namespace locked: %v", err)
+	}
+	defer nsUnlock()
+	return nil
+}
+
+func (bnc *BaseNetworkController) deleteNamespace(ns *corev1.Namespace) error {
+	klog.Infof("[%s] deleting namespace for network %s", ns.Name, bnc.GetNetworkName())
+
+	nsInfo, err := bnc.deleteNamespaceLocked(ns.Name)
 	if err != nil {
 		return err
 	}
-	bnc.namespaceHandler = handler
-	return err
+	if nsInfo == nil {
+		return nil
+	}
+	defer nsInfo.Unlock()
+
+	if bnc.postDeleteNamespace != nil {
+		if err := bnc.postDeleteNamespace(ns.Name); err != nil {
+			return err
+		}
+	}
+	if err := bnc.multicastDeleteNamespace(ns, nsInfo); err != nil {
+		return fmt.Errorf("failed to delete multicast namespace error %v", err)
+	}
+	return nil
+}
+
+// ensureNamespaceLocked locks namespacesMutex, gets/creates an entry for ns, configures OVN nsInfo, and returns it
+// with its mutex locked.
+// ns is the name of the namespace, while namespace is the optional k8s namespace object.
+func (bnc *BaseNetworkController) ensureNamespaceLocked(ns string, readOnly bool, namespace *corev1.Namespace) (*namespaceInfo, func(), error) {
+	return bnc.ensureNamespaceLockedCommon(ns, readOnly, namespace, bnc.configureNamespaceCommon)
 }
 
 // aclLoggingUpdateNsInfo parses the provided annotation values and sets nsInfo.aclLogging.Deny and
@@ -302,26 +529,29 @@ func (bnc *BaseNetworkController) needNamespacedPortGroup() bool {
 }
 
 func (bnc *BaseNetworkController) configureNamespaceCommon(nsInfo *namespaceInfo, ns *corev1.Namespace) error {
-	if annotation, ok := ns.Annotations[util.AclLoggingAnnotation]; ok {
-		if err := bnc.aclLoggingUpdateNsInfo(annotation, nsInfo); err == nil {
-			klog.Infof("Namespace %s: ACL logging is set to deny=%s allow=%s", ns.Name, nsInfo.aclLogging.Deny, nsInfo.aclLogging.Allow)
-		} else {
-			klog.Warningf("Namespace %s: ACL logging contained malformed annotation, "+
-				"ACL logging is set to deny=%s allow=%s, err: %q",
-				ns.Name, nsInfo.aclLogging.Deny, nsInfo.aclLogging.Allow, err)
+	var errors []error
+
+	aclAnnotation := ns.Annotations[util.AclLoggingAnnotation]
+	// If ACL logging settings changed or need updating
+	oldACLLevels := nsInfo.aclLogging
+	var tempNsInfo namespaceInfo
+	_ = bnc.aclLoggingUpdateNsInfo(aclAnnotation, &tempNsInfo)
+	if tempNsInfo.aclLogging != oldACLLevels {
+		if err := bnc.updateNamespaceAclLogging(ns.Name, aclAnnotation, nsInfo); err != nil {
+			errors = append(errors, err)
+		}
+		if bnc.postNamespaceUpdateAclLogging != nil {
+			if err := bnc.postNamespaceUpdateAclLogging(ns.Name, nsInfo); err != nil {
+				errors = append(errors, err)
+			}
 		}
 	}
 
-	// TODO(trozet) figure out if there is any possibility of detecting if a pod GW already exists, which
-	// is servicing this namespace. Right now that would mean searching through all pods, which is very inefficient.
-	// For now it is required that a pod serving as a gateway for a namespace is added AFTER the serving namespace is
-	// created
-
 	// If multicast enabled, adds all current pods in the namespace to the allow policy
 	if err := bnc.multicastUpdateNamespace(ns, nsInfo); err != nil {
-		return fmt.Errorf("failed to update multicast (%v)", err)
+		errors = append(errors, fmt.Errorf("failed to update multicast (%v)", err))
 	}
-	return nil
+	return utilerrors.Join(errors...)
 }
 
 // GetNamespaceACLLogging retrieves ACLLoggingLevels for the Namespace.

@@ -21,8 +21,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	ref "k8s.io/client-go/tools/reference"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 
@@ -97,8 +99,6 @@ type BaseNetworkController struct {
 
 	// retry framework for pods
 	retryPods *ovnretry.RetryFramework
-	// retry framework for namespaces
-	retryNamespaces *ovnretry.RetryFramework
 	// retry framework for network policies
 	retryNetworkPolicies *ovnretry.RetryFramework
 	// retry framework for network policies
@@ -112,8 +112,13 @@ type BaseNetworkController struct {
 
 	// pod events factory handler
 	podHandler *factory.Handler
-	// namespace events factory Handler
-	namespaceHandler *factory.Handler
+	// namespace workqueue and handler
+	namespaceQueue   workqueue.TypedRateLimitingInterface[string]
+	namespaceHandler cache.ResourceEventHandlerRegistration
+
+	// optional hooks for network controller-specific namespace reconciliation
+	postNamespaceUpdateAclLogging func(nsName string, nsInfo *namespaceInfo) error
+	postDeleteNamespace           func(nsName string) error
 
 	// A cache of all logical switches seen by the watcher and their subnets
 	lsManager *lsm.LogicalSwitchManager
@@ -266,25 +271,13 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 	// network controller creates the address set for the namespace.
 	// To update gress policy ACLs with peer namespace address set, invoke requeuePeerNamespace method after
 	// address set is created for the namespace.
-	namespaceAdded := false
 	for _, ns := range reconcileNamespaces {
-		namespace, err := oc.watchFactory.GetNamespace(ns)
-		if err != nil {
-			klog.Infof("Failed to get namespace %s for reconciling network %s: %v", ns, oc.GetNetworkName(), err)
-			continue
+		if oc.namespaceQueue != nil {
+			oc.namespaceQueue.Add(ns)
 		}
-		err = oc.retryNamespaces.AddRetryObjWithAddNoBackoff(namespace)
-		if err != nil {
-			klog.Infof("Failed to retry namespace %s for network %s: %v", ns, oc.GetNetworkName(), err)
-			continue
-		}
-		namespaceAdded = true
 		if err := oc.addRemotePodsInNamespace(ns); err != nil {
 			klog.Errorf("Failed to requeue remote pods for namespace %s on network %s: %v", ns, oc.GetNetworkName(), err)
 		}
-	}
-	if namespaceAdded {
-		oc.retryNamespaces.RequestRetryObjs()
 	}
 	return nil
 }

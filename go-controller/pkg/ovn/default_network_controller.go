@@ -12,6 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	knet "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -267,7 +268,33 @@ func newDefaultNetworkControllerCommon(
 
 	oc.ovnClusterLRPToJoinIfAddrs = gwLRPIfAddrs
 
+	oc.postNamespaceUpdateAclLogging = func(nsName string, nsInfo *namespaceInfo) error {
+		if oc.efController != nil {
+			egressFirewalls, err := oc.watchFactory.EgressFirewallInformer().Lister().EgressFirewalls(nsName).List(labels.Everything())
+			if err != nil {
+				return err
+			}
+			for _, fw := range egressFirewalls {
+				fwKey, err := cache.MetaNamespaceKeyFunc(fw)
+				if err != nil {
+					klog.Errorf("Failed to get key for EgressFirewall %s/%s, will not update ACL logging: %v", nsName, fwKey, err)
+					continue
+				}
+				klog.Infof("Namespace %s: EgressFirewall ACL logging setting updating to deny=%s allow=%s",
+					nsName, nsInfo.aclLogging.Deny, nsInfo.aclLogging.Allow)
+				oc.efController.Reconcile(fwKey)
+			}
+		}
+		return nil
+	}
+	oc.postDeleteNamespace = func(nsName string) error {
+		return oc.deleteGWRoutesForNamespace(nsName, nil)
+	}
+
 	oc.initRetryFramework()
+	if err := oc.initNamespaceHandlers(); err != nil {
+		return nil, err
+	}
 	if oc.eIPC != nil {
 		oc.eIPC.retryEgressIPPods = oc.retryEgressIPPods
 	}
@@ -282,7 +309,6 @@ func (oc *DefaultNetworkController) initRetryFramework() {
 	oc.retryEgressIPNamespaces = oc.newRetryFramework(factory.EgressIPNamespaceType)
 	oc.retryEgressIPPods = oc.newRetryFramework(factory.EgressIPPodType)
 	oc.retryEgressNodes = oc.newRetryFramework(factory.EgressNodeType)
-	oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
 	oc.retryNetworkPolicies = oc.newRetryFramework(factory.PolicyType)
 }
 
@@ -374,6 +400,8 @@ func (oc *DefaultNetworkController) Stop() {
 	if oc.uplinkStateController != nil {
 		oc.uplinkStateController.Stop()
 	}
+
+	oc.StopNamespaces()
 
 	close(oc.stopChan)
 	oc.cancelableCtx.Cancel()
@@ -1073,13 +1101,6 @@ func (h *defaultNetworkControllerEventHandler) AddResource(obj interface{}, from
 		}
 		return nil
 
-	case factory.NamespaceType:
-		ns, ok := obj.(*corev1.Namespace)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *corev1.Namespace", obj)
-		}
-		return h.oc.AddNamespace(ns)
-
 	default:
 		return h.oc.AddResourceCommon(h.objType, obj)
 	}
@@ -1154,10 +1175,6 @@ func (h *defaultNetworkControllerEventHandler) UpdateResource(oldObj, newObj int
 			h.oc.syncEIPNodeFailed.Delete(newNode.Name)
 		}
 		return nil
-
-	case factory.NamespaceType:
-		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
-		return h.oc.updateNamespace(oldNs, newNs)
 	}
 	return fmt.Errorf("no update function for object type %s", h.objType)
 }
@@ -1204,10 +1221,6 @@ func (h *defaultNetworkControllerEventHandler) DeleteResource(obj, cachedObj int
 		h.oc.syncEIPNodeFailed.Delete(node.Name)
 		return nil
 
-	case factory.NamespaceType:
-		ns := obj.(*corev1.Namespace)
-		return h.oc.deleteNamespace(ns)
-
 	default:
 		return h.oc.DeleteResourceCommon(h.objType, obj)
 	}
@@ -1236,9 +1249,6 @@ func (h *defaultNetworkControllerEventHandler) SyncFunc(objs []interface{}) erro
 		case factory.EgressIPNamespaceType,
 			factory.EgressIPType:
 			syncFunc = nil
-
-		case factory.NamespaceType:
-			syncFunc = h.oc.syncNamespaces
 
 		default:
 			return fmt.Errorf("no sync function for object type %s", h.objType)
