@@ -47,29 +47,50 @@ func (bsnc *BaseUserDefinedNetworkController) getPortInfoForUserDefinedNetwork(p
 	return portInfoMap
 }
 
-// GetInternalCacheEntryForUserDefinedNetwork returns the internal cache entry for this object, given an object and its type.
-// This is now used only for pods, which will get their the logical port cache entry.
-func (bsnc *BaseUserDefinedNetworkController) GetInternalCacheEntryForUserDefinedNetwork(objType reflect.Type, obj interface{}) interface{} {
-	switch objType {
-	case factory.PodType:
-		pod := obj.(*corev1.Pod)
-		return bsnc.getPortInfoForUserDefinedNetwork(pod)
-	default:
-		return nil
+func (bsnc *BaseUserDefinedNetworkController) SyncPods(pods []interface{}) error {
+	return bsnc.syncPodsForUserDefinedNetwork(pods)
+}
+
+func (bsnc *BaseUserDefinedNetworkController) EnsurePod(oldPod, curPod *corev1.Pod, addPort bool) error {
+	if !addPort {
+		addPort = bsnc.shouldAddPort(oldPod, curPod)
 	}
+	return bsnc.ensurePodForUserDefinedNetwork(curPod, addPort)
+}
+
+func (bsnc *BaseUserDefinedNetworkController) shouldAddPort(oldPod, curPod *corev1.Pod) bool {
+	if oldPod == nil {
+		return true
+	}
+	if util.PodScheduled(oldPod) != util.PodScheduled(curPod) {
+		return true
+	}
+	if bsnc.dhcpPodNetworkUpdated(oldPod, curPod) {
+		return true
+	}
+	if bsnc.isPodScheduledOnLocalNode(curPod) && !util.PodWantsHostNetwork(curPod) {
+		portInfoMap := bsnc.getPortInfoForUserDefinedNetwork(curPod)
+		if len(portInfoMap) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (bsnc *BaseUserDefinedNetworkController) RemovePod(pod *corev1.Pod) error {
+	portInfoMap := bsnc.getPortInfoForUserDefinedNetwork(pod)
+	return bsnc.removePodForUserDefinedNetwork(pod, portInfoMap)
+}
+
+// GetInternalCacheEntryForUserDefinedNetwork returns the internal cache entry for this object, given an object and its type.
+func (bsnc *BaseUserDefinedNetworkController) GetInternalCacheEntryForUserDefinedNetwork(objType reflect.Type, obj interface{}) interface{} {
+	return nil
 }
 
 // AddUserDefinedNetworkResourceCommon adds the specified object to the cluster according to its type and returns the error,
 // if any, yielded during object creation. This function is called for User Defined Networks only.
 func (bsnc *BaseUserDefinedNetworkController) AddUserDefinedNetworkResourceCommon(objType reflect.Type, obj interface{}) error {
 	switch objType {
-	case factory.PodType:
-		pod, ok := obj.(*corev1.Pod)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *knet.Pod", obj)
-		}
-		return bsnc.ensurePodForUserDefinedNetwork(pod, true)
-
 	case factory.NamespaceType:
 		ns, ok := obj.(*corev1.Namespace)
 		if !ok {
@@ -110,14 +131,6 @@ func (bsnc *BaseUserDefinedNetworkController) AddUserDefinedNetworkResourceCommo
 // is in the retryCache or not.
 func (bsnc *BaseUserDefinedNetworkController) UpdateUserDefinedNetworkResourceCommon(objType reflect.Type, oldObj, newObj interface{}, inRetryCache bool) error {
 	switch objType {
-	case factory.PodType:
-		oldPod := oldObj.(*corev1.Pod)
-		newPod := newObj.(*corev1.Pod)
-
-		addPort := shouldAddPort(oldPod, newPod, inRetryCache) ||
-			bsnc.dhcpPodNetworkUpdated(oldPod, newPod)
-		return bsnc.ensurePodForUserDefinedNetwork(newPod, addPort)
-
 	case factory.NamespaceType:
 		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
 		return bsnc.updateNamespaceForUserDefinedNetwork(oldNs, newNs)
@@ -171,15 +184,6 @@ func (bsnc *BaseUserDefinedNetworkController) UpdateUserDefinedNetworkResourceCo
 // This function is called for User Defined Networks only.
 func (bsnc *BaseUserDefinedNetworkController) DeleteUserDefinedNetworkResourceCommon(objType reflect.Type, obj, cachedObj interface{}) error {
 	switch objType {
-	case factory.PodType:
-		var portInfoMap map[string]*lpInfo
-		pod := obj.(*corev1.Pod)
-
-		if cachedObj != nil {
-			portInfoMap = cachedObj.(map[string]*lpInfo)
-		}
-		return bsnc.removePodForUserDefinedNetwork(pod, portInfoMap)
-
 	case factory.NamespaceType:
 		ns := obj.(*corev1.Namespace)
 		return bsnc.deleteNamespaceForUserDefinedNetwork(ns)

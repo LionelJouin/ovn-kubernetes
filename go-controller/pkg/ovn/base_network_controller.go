@@ -21,8 +21,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	ref "k8s.io/client-go/tools/reference"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 
@@ -31,6 +33,7 @@ import (
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/pod"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
@@ -95,8 +98,12 @@ type BaseNetworkController struct {
 	nadKeysLock sync.Mutex
 	lastNADKeys sets.Set[string]
 
-	// retry framework for pods
-	retryPods *ovnretry.RetryFramework
+	// pod workqueue
+	podQueue      workqueue.TypedRateLimitingInterface[string]
+	podHandler    cache.ResourceEventHandlerRegistration
+	podCache      sync.Map // map[string]*corev1.Pod
+	podReconciler PodReconciler
+
 	// retry framework for namespaces
 	retryNamespaces *ovnretry.RetryFramework
 	// retry framework for network policies
@@ -110,8 +117,6 @@ type BaseNetworkController struct {
 	// node annotation cache for shared node controllers (optional)
 	nodeAnnotationCache *nodecontroller.NodeAnnotationCache
 
-	// pod events factory handler
-	podHandler *factory.Handler
 	// namespace events factory Handler
 	namespaceHandler *factory.Handler
 
@@ -257,7 +262,7 @@ func (oc *BaseNetworkController) doReconcile(reconcileRoutes, reconcilePendingPo
 	}
 
 	if reconcilePendingPods {
-		if err := ovnretry.RequeuePendingPods(oc.watchFactory, oc.GetNetInfo(), oc.retryPods); err != nil {
+		if err := oc.requeuePendingPods(); err != nil {
 			klog.Errorf("Failed to requeue pending pods for network %s: %v", oc.GetNetworkName(), err)
 		}
 	}
@@ -687,24 +692,20 @@ func (bnc *BaseNetworkController) addAllPodsOnNode(nodeName string) []error {
 		klog.Errorf("Unable to list existing pods for synchronizing node: %s, existing pods on this node may not function",
 			nodeName)
 	} else {
-		klog.V(5).Infof("When adding node %s for network %s, found %d pods to add to retryPods", nodeName, bnc.GetNetworkName(), len(pods))
+		klog.V(5).Infof("When adding node %s for network %s, found %d pods to add to podQueue", nodeName, bnc.GetNetworkName(), len(pods))
 		for _, pod := range pods {
-			pod := *pod
-			if util.PodCompleted(&pod) {
+			if util.PodCompleted(pod) || pod.Spec.NodeName != nodeName {
 				continue
 			}
-			if pod.Spec.NodeName != nodeName {
-				continue
-			}
-			klog.V(5).Infof("Adding pod %s/%s to retryPods for network %s", pod.Namespace, pod.Name, bnc.GetNetworkName())
-			err = bnc.retryPods.AddRetryObjWithAddNoBackoff(&pod)
+			klog.V(5).Infof("Adding pod %s/%s to podQueue for network %s", pod.Namespace, pod.Name, bnc.GetNetworkName())
+			key, err := cache.MetaNamespaceKeyFunc(pod)
 			if err != nil {
 				errs = append(errs, err)
-				klog.Errorf("Failed to add pod %s/%s to retryPods for network %s: %v", pod.Namespace, pod.Name, bnc.GetNetworkName(), err)
+				continue
 			}
+			bnc.podQueue.Add(key)
 		}
 	}
-	bnc.retryPods.RequestRetryObjs()
 	return errs
 }
 
@@ -720,24 +721,60 @@ func (bnc *BaseNetworkController) addRemotePodsInNamespace(namespace string) err
 	}
 
 	var errs []error
-	podsAdded := false
 	for _, pod := range pods {
-		pod := *pod
-		if util.PodCompleted(&pod) || util.PodWantsHostNetwork(&pod) || bnc.isPodScheduledOnLocalNode(&pod) {
+		if util.PodCompleted(pod) || util.PodWantsHostNetwork(pod) || bnc.isPodScheduledOnLocalNode(pod) {
 			continue
 		}
-		klog.V(5).Infof("Adding remote running pod %s/%s to retryPods for network %s",
+		klog.V(5).Infof("Adding remote running pod %s/%s to podQueue for network %s",
 			pod.Namespace, pod.Name, bnc.GetNetworkName())
-		if err := bnc.retryPods.AddRetryObjWithAddNoBackoff(&pod); err != nil {
-			errs = append(errs, fmt.Errorf("failed to add pod %s/%s to retryPods: %w", pod.Namespace, pod.Name, err))
+		key, err := cache.MetaNamespaceKeyFunc(pod)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to get key for pod %s/%s: %w", pod.Namespace, pod.Name, err))
 			continue
 		}
-		podsAdded = true
-	}
-	if podsAdded {
-		bnc.retryPods.RequestRetryObjs()
+		bnc.podQueue.Add(key)
 	}
 	return utilerrors.Join(errs...)
+}
+
+func (bnc *BaseNetworkController) requeuePendingPods() error {
+	allPods, err := bnc.watchFactory.GetAllPods()
+	if err != nil {
+		return fmt.Errorf("failed to get all pods: %w", err)
+	}
+	for _, pod := range allPods {
+		if !util.PodScheduled(pod) || pod.Status.Phase != corev1.PodPending {
+			continue
+		}
+		key, err := cache.MetaNamespaceKeyFunc(pod)
+		if err != nil {
+			continue
+		}
+		bnc.podQueue.Add(key)
+	}
+	return nil
+}
+
+func (bnc *BaseNetworkController) initPodController(podReconciler PodReconciler) {
+	bnc.podReconciler = podReconciler
+	queueName := fmt.Sprintf("%s-pods", bnc.GetNetworkName())
+	if bnc.GetNetworkName() == types.DefaultNetworkName {
+		queueName = "ovn-pods"
+	}
+	bnc.podQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: queueName},
+	)
+}
+
+func (bnc *BaseNetworkController) DeregisterPodHandler() {
+	if bnc.podQueue != nil {
+		bnc.podQueue.ShutDown()
+	}
+	if bnc.podHandler != nil {
+		_ = bnc.watchFactory.PodInformer().RemoveEventHandler(bnc.podHandler)
+		bnc.podHandler = nil
+	}
 }
 
 // getNamespaceLocked locks namespacesMutex, looks up ns, and (if found), returns it with

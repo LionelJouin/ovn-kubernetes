@@ -256,6 +256,12 @@ func (o *FakeOVN) shutdown() {
 	if o.controller != nil && o.controller.nodeReconciler != nil {
 		o.controller.nodeReconciler.Stop()
 	}
+	if o.controller != nil {
+		o.controller.DeregisterPodHandler()
+	}
+	for _, ocInfo := range o.userDefinedNetworkControllers {
+		ocInfo.bnc.DeregisterPodHandler()
+	}
 	o.watcher.Shutdown()
 	close(o.stopChan)
 	o.controller.cancelableCtx.Cancel()

@@ -18,7 +18,6 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	libovsdbtest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/libovsdb"
 	ovntypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
@@ -166,9 +165,8 @@ var _ = ginkgo.Describe("OVN Pod Operations with network segmentation", func() {
 					namespaceT.Name,
 				)
 
+				var err error
 				pod := testing.NewPod(t.namespace, t.podName, t.nodeName, t.podIP)
-				key, err := retry.GetResourceKey(pod)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 				// Pod informer will see the pod, but the namespace informer will
 				// not have the namespace yet. GetPrimaryNADForNamespace returns
@@ -196,9 +194,6 @@ var _ = ginkgo.Describe("OVN Pod Operations with network segmentation", func() {
 				err = fakeOvn.controller.WatchPods()
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-				// Pod add fails and is queued for retry while namespace is missing.
-				retry.CheckRetryObjectEventually(key, true, fakeOvn.controller.retryPods)
-
 				// Pod annotation must not be written before namespace is in the informer.
 				gomega.Consistently(func() bool {
 					p, getErr := fakeOvn.fakeClient.KubeClient.CoreV1().Pods(t.namespace).Get(
@@ -220,10 +215,6 @@ var _ = ginkgo.Describe("OVN Pod Operations with network segmentation", func() {
 					return getErr
 				}).Should(gomega.Succeed(), "namespace informer should have the namespace")
 
-				// Set retry object with no backoff to immediately retry the pod.
-				retry.SetRetryObjWithNoBackoff(key, fakeOvn.controller.retryPods)
-				fakeOvn.controller.retryPods.RequestRetryObjs()
-
 				// Pod annotation should be written and should have role=primary.
 				var podAnnotation *util.PodAnnotation
 				gomega.Eventually(func() bool {
@@ -240,9 +231,6 @@ var _ = ginkgo.Describe("OVN Pod Operations with network segmentation", func() {
 					}
 					return podAnnotation.Role == ovntypes.NetworkRolePrimary
 				}).Should(gomega.BeTrue(), fmt.Sprintf("pod annotation should be written and should have role=primary: %v", podAnnotation))
-
-				// Pod should not be queued for retry.
-				retry.CheckRetryObjectEventually(key, false, fakeOvn.controller.retryPods)
 
 				return nil
 			}

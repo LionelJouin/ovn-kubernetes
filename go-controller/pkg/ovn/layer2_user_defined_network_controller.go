@@ -144,9 +144,6 @@ func (h *layer2UserDefinedNetworkControllerEventHandler) SyncFunc(objs []interfa
 		syncFunc = h.syncFunc
 	} else {
 		switch h.objType {
-		case factory.PodType:
-			syncFunc = h.oc.syncPodsForUserDefinedNetwork
-
 		case factory.NamespaceType:
 			syncFunc = h.oc.syncNamespaces
 
@@ -597,7 +594,7 @@ func (oc *Layer2UserDefinedNetworkController) SyncNodes(nodes []*corev1.Node) er
 }
 
 func (oc *Layer2UserDefinedNetworkController) initRetryFramework() {
-	oc.retryPods = oc.newRetryFramework(factory.PodType)
+	oc.initPodController(&oc.BaseUserDefinedNetworkController)
 
 	// When a user-defined network is enabled as a primary network for namespace,
 	// then watch for namespace and network policy events.

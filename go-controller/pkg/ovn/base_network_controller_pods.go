@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/cache"
 	k8sretry "k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
@@ -26,10 +27,12 @@ import (
 	subnetipallocator "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/ip/subnet"
 	podallocator "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/pod"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kubevirt"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics/recorders"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	ovntypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
@@ -729,17 +732,207 @@ func (bnc *BaseNetworkController) isPodScheduledOnLocalNode(pod *corev1.Pod) boo
 	return util.PodScheduled(pod) && pod.Spec.NodeName == bnc.nodeName
 }
 
+// PodReconciler defines the network-specific hooks invoked during pod reconciliation.
+type PodReconciler interface {
+	SyncPods(pods []interface{}) error
+	EnsurePod(oldPod, curPod *corev1.Pod, addPort bool) error
+	RemovePod(pod *corev1.Pod) error
+}
+
 // WatchPods starts the watching of the Pod resource and calls back the appropriate handler logic
 func (bnc *BaseNetworkController) WatchPods() error {
 	if bnc.podHandler != nil {
 		return nil
 	}
-
-	handler, err := bnc.retryPods.WatchResource()
-	if err == nil {
-		bnc.podHandler = handler
+	if bnc.podQueue == nil {
+		return fmt.Errorf("podQueue is not initialized for network %s", bnc.GetNetworkName())
 	}
-	return err
+	if bnc.podReconciler == nil {
+		return fmt.Errorf("podReconciler is not initialized for network %s", bnc.GetNetworkName())
+	}
+
+	pods, err := bnc.watchFactory.GetAllPods()
+	if err != nil {
+		return fmt.Errorf("failed to get pods for initial sync: %w", err)
+	}
+	podObjs := make([]interface{}, len(pods))
+	for i, p := range pods {
+		podObjs[i] = p
+	}
+	if err := bnc.podReconciler.SyncPods(podObjs); err != nil {
+		return fmt.Errorf("failed to sync pods for network %s: %w", bnc.GetNetworkName(), err)
+	}
+
+	return bnc.watchPodsWithWorkers(1)
+}
+
+func (bnc *BaseNetworkController) watchPodsWithWorkers(workers int) error {
+	if bnc.wg == nil {
+		return fmt.Errorf("controller wg is nil for network %s", bnc.GetNetworkName())
+	}
+
+	bnc.wg.Add(1)
+	go func() {
+		defer bnc.wg.Done()
+		<-bnc.stopChan
+		bnc.podQueue.ShutDown()
+	}()
+
+	for i := 0; i < workers; i++ {
+		bnc.wg.Add(1)
+		go func() {
+			defer bnc.wg.Done()
+			wait.UntilWithContext(wait.ContextForChannel(bnc.stopChan), bnc.runPodWorker, time.Second)
+		}()
+	}
+
+	var err error
+	bnc.podHandler, err = bnc.watchFactory.PodInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    bnc.onPodAdd,
+			UpdateFunc: bnc.onPodUpdate,
+			DeleteFunc: bnc.onPodDelete,
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to register pod event handler for network %s: %w", bnc.GetNetworkName(), err)
+	}
+
+	return nil
+}
+
+func (bnc *BaseNetworkController) onPodAdd(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		return
+	}
+	bnc.podQueue.Add(key)
+}
+
+func (bnc *BaseNetworkController) onPodUpdate(oldObj, newObj interface{}) {
+	_, ok1 := oldObj.(*corev1.Pod)
+	newPod, ok2 := newObj.(*corev1.Pod)
+	if !ok1 || !ok2 {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(newPod)
+	if err != nil {
+		return
+	}
+	bnc.podQueue.Add(key)
+}
+
+func (bnc *BaseNetworkController) onPodDelete(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		return
+	}
+	bnc.podCache.LoadOrStore(key, pod.DeepCopy())
+	bnc.podQueue.Add(key)
+}
+
+func (bnc *BaseNetworkController) runPodWorker(_ context.Context) {
+	for bnc.processPodItem() {
+	}
+}
+
+func (bnc *BaseNetworkController) processPodItem() bool {
+	key, shutdown := bnc.podQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer bnc.podQueue.Done(key)
+
+	err := bnc.reconcilePod(key)
+	if err != nil {
+		if bnc.podQueue.NumRequeues(key) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling pod %s for network %s: %v, requeuing", key, bnc.GetNetworkName(), err)
+			bnc.podQueue.AddRateLimited(key)
+			return true
+		}
+		klog.Errorf("Dropping pod %s out of queue for network %s after %d attempts: %v",
+			key, bnc.GetNetworkName(), controller.DefaultMaxAttempts, err)
+	}
+	bnc.podQueue.Forget(key)
+	return true
+}
+
+func (bnc *BaseNetworkController) reconcilePod(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	recorders.GetConfigDurationRecorder().Start("pod", namespace, name)
+
+	cachedVal, hadCached := bnc.podCache.Load(key)
+	curPod, err := bnc.watchFactory.GetPod(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if hadCached {
+				oldPod := cachedVal.(*corev1.Pod)
+				if !util.PodCompleted(oldPod) {
+					if err := bnc.podReconciler.RemovePod(oldPod); err != nil {
+						return err
+					}
+				}
+				bnc.podCache.Delete(key)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get pod %s: %w", key, err)
+	}
+
+	if hadCached {
+		oldPod := cachedVal.(*corev1.Pod)
+		if oldPod.UID != curPod.UID {
+			if !util.PodCompleted(oldPod) {
+				if err := bnc.podReconciler.RemovePod(oldPod); err != nil {
+					return err
+				}
+			}
+			bnc.podCache.Delete(key)
+			if !util.PodCompleted(curPod) {
+				if err := bnc.podReconciler.EnsurePod(nil, curPod, true); err != nil {
+					return err
+				}
+			}
+		} else if util.PodCompleted(curPod) {
+			if !util.PodCompleted(oldPod) {
+				if err := bnc.podReconciler.RemovePod(oldPod); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := bnc.podReconciler.EnsurePod(oldPod, curPod, false); err != nil {
+				return err
+			}
+		}
+	} else {
+		if !util.PodCompleted(curPod) {
+			if err := bnc.podReconciler.EnsurePod(nil, curPod, true); err != nil {
+				return err
+			}
+		}
+	}
+
+	bnc.podCache.Store(key, curPod.DeepCopy())
+	return nil
 }
 
 func calculateStaticIPs(podDesc string, ips []string) ([]*net.IPNet, error) {

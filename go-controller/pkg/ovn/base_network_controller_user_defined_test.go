@@ -770,7 +770,9 @@ var _ = Describe("BaseUserDefinedNetworkController", func() {
 
 		key, err := retry.GetResourceKey(remotePod)
 		Expect(err).NotTo(HaveOccurred())
-		retry.CheckRetryObjectEventually(key, true, bnc.retryPods)
+		Expect(bnc.podQueue.Len()).To(BeNumerically(">", 0))
+		item, _ := bnc.podQueue.Get()
+		Expect(item).To(Equal(key))
 	})
 
 	Context("when shouldFilterNamespace does not filter a pod because the namespace is missing from the informer", func() {

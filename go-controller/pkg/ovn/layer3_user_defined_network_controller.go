@@ -138,9 +138,6 @@ func (h *Layer3UserDefinedNetworkControllerEventHandler) SyncFunc(objs []interfa
 		syncFunc = h.syncFunc
 	} else {
 		switch h.objType {
-		case factory.PodType:
-			syncFunc = h.oc.syncPodsForUserDefinedNetwork
-
 		case factory.NamespaceType:
 			syncFunc = h.oc.syncNamespaces
 
@@ -292,7 +289,7 @@ func NewLayer3UserDefinedNetworkController(
 }
 
 func (oc *Layer3UserDefinedNetworkController) initRetryFramework() {
-	oc.retryPods = oc.newRetryFramework(factory.PodType)
+	oc.initPodController(&oc.BaseUserDefinedNetworkController)
 
 	// When a user-defined network is enabled as a primary network for namespace,
 	// then watch for namespace and network policy events.
@@ -372,9 +369,7 @@ func (oc *Layer3UserDefinedNetworkController) Stop() {
 	if oc.multiNetPolicyHandler != nil {
 		oc.watchFactory.RemoveMultiNetworkPolicyHandler(oc.multiNetPolicyHandler)
 	}
-	if oc.podHandler != nil {
-		oc.watchFactory.RemovePodHandler(oc.podHandler)
-	}
+	oc.DeregisterPodHandler()
 	if oc.namespaceHandler != nil {
 		oc.watchFactory.RemoveNamespaceHandler(oc.namespaceHandler)
 	}

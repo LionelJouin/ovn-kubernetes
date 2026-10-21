@@ -28,8 +28,7 @@ type baseNetworkControllerEventHandler struct{}
 // object and then add the new one.
 func hasResourceAnUpdateFunc(objType reflect.Type) bool {
 	switch objType {
-	case factory.PodType,
-		factory.NodeType,
+	case factory.NodeType,
 		factory.EgressIPType,
 		factory.EgressIPNamespaceType,
 		factory.EgressIPPodType,
@@ -74,8 +73,7 @@ func (h *baseNetworkControllerEventHandler) areResourcesEqual(objType reflect.Ty
 		// when shouldUpdateNode is false, the hostsubnet is not assigned by ovn-kubernetes
 		return !shouldUpdateNode(node2, node1), nil
 
-	case factory.PodType,
-		factory.EgressIPPodType:
+	case factory.EgressIPPodType:
 		// For these types, there was no old vs new obj comparison in the original update code,
 		// so pretend they're always different so that the update code gets executed
 		return false, nil
@@ -140,8 +138,7 @@ func (h *baseNetworkControllerEventHandler) getResourceFromInformerCache(objType
 		factory.EgressNodeType:
 		obj, err = watchFactory.GetNode(name)
 
-	case factory.PodType,
-		factory.EgressIPPodType:
+	case factory.EgressIPPodType:
 		obj, err = watchFactory.GetPod(namespace, name)
 
 	case factory.EgressIPNamespaceType,
@@ -165,13 +162,8 @@ func (h *baseNetworkControllerEventHandler) getResourceFromInformerCache(objType
 }
 
 // Given an object and its type, isResourceScheduled returns true if the object has been scheduled.
-// Only applied to pods for now. Returns true for all other types.
+// Returns true for all remaining types.
 func (h *baseNetworkControllerEventHandler) isResourceScheduled(objType reflect.Type, obj interface{}) bool {
-	switch objType {
-	case factory.PodType:
-		pod := obj.(*corev1.Pod)
-		return util.PodScheduled(pod)
-	}
 	return true
 }
 
@@ -191,8 +183,7 @@ func needsUpdateDuringRetry(objType reflect.Type) bool {
 // IsObjectInTerminalState returns true if the object is in a terminal state.
 func (h *baseNetworkControllerEventHandler) isObjectInTerminalState(objType reflect.Type, obj interface{}) bool {
 	switch objType {
-	case factory.PodType,
-		factory.EgressIPPodType:
+	case factory.EgressIPPodType:
 		pod := obj.(*corev1.Pod)
 		return util.PodCompleted(pod)
 
