@@ -16,13 +16,14 @@ import (
 	nadinformerv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/informers/externalversions/k8s.cni.cncf.io/v1"
 
 	corev1 "k8s.io/api/core/v1"
-	knet "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	ref "k8s.io/client-go/tools/reference"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 
@@ -99,10 +100,9 @@ type BaseNetworkController struct {
 	retryPods *ovnretry.RetryFramework
 	// retry framework for namespaces
 	retryNamespaces *ovnretry.RetryFramework
-	// retry framework for network policies
-	retryNetworkPolicies *ovnretry.RetryFramework
-	// retry framework for network policies
-	retryMultiNetworkPolicies *ovnretry.RetryFramework
+
+	networkPolicyQueue   workqueue.TypedRateLimitingInterface[string]
+	networkPolicyHandler cache.ResourceEventHandlerRegistration
 
 	// nodeReconciler is the shared node controller used by controllers that
 	// reconcile node topology through pkg/controllers/node.
@@ -299,10 +299,8 @@ func (oc *BaseNetworkController) DeregisterNodeHandler() {
 type BaseUserDefinedNetworkController struct {
 	BaseNetworkController
 
-	// network policy events factory handler
-	netPolicyHandler *factory.Handler
-	// multi-network policy events factory handler
-	multiNetPolicyHandler *factory.Handler
+	multiNetworkPolicyQueue workqueue.TypedRateLimitingInterface[string]
+	multiNetPolicyHandler   cache.ResourceEventHandlerRegistration
 }
 
 func (oc *BaseUserDefinedNetworkController) FilterOutResource(objType reflect.Type, obj interface{}) bool {
@@ -1061,70 +1059,13 @@ func (bnc *BaseNetworkController) findMigratablePodIPsForSubnets(subnets []*net.
 	return ipsByOwner, nil
 }
 
-func (bnc *BaseNetworkController) AddResourceCommon(objType reflect.Type, obj interface{}) error {
-	switch objType {
-	case factory.PolicyType:
-		np, ok := obj.(*knet.NetworkPolicy)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *knet.NetworkPolicy", obj)
-		}
-		foundNamespaceNAD, err := bnc.networkManager.GetPrimaryNADForNamespace(np.Namespace)
-		if err != nil {
-			// If this is a UDN namespace that hasn't been processed yet, the default
-			// controller should skip it while UDN controllers should retry.
-			if bnc.GetNetworkName() == types.DefaultNetworkName && util.IsInvalidPrimaryNetworkError(err) {
-				return nil
-			}
-			// Retry until the NAD controller has processed the primary NAD for this namespace.
-			return fmt.Errorf("could not get primary network NAD for namespace %s: %v", np.Namespace, err)
-		}
-		if foundNamespaceNAD == types.DefaultNetworkName {
-			// Only the default network controller should handle policies in default namespaces.
-			if bnc.GetNetworkName() != types.DefaultNetworkName {
-				return nil
-			}
-		} else {
-			networkName := bnc.networkManager.GetNetworkNameForNADKey(foundNamespaceNAD)
-			if networkName == "" {
-				return fmt.Errorf("no primary network found for namespace %s", np.Namespace)
-			}
-			if bnc.GetNetworkName() != networkName {
-				return nil
-			}
-		}
-		netInfo, err := bnc.networkManager.GetActiveNetworkForNamespace(np.Namespace)
-		if err != nil {
-			return fmt.Errorf("could not get active network for namespace %s: %v", np.Namespace, err)
-		}
-		if netInfo == nil {
-			// no active network, nothing to do
-			return nil
-		}
-		if bnc.GetNetworkName() != netInfo.GetNetworkName() {
-			return nil
-		}
-		if err := bnc.addNetworkPolicy(np); err != nil {
-			klog.Infof("Network Policy add failed for %s/%s, will try again later: %v",
-				np.Namespace, np.Name, err)
-			return err
-		}
-	default:
-		klog.Errorf("Can not process add resource event, object type %s is not supported", objType)
-	}
+func (bnc *BaseNetworkController) AddResourceCommon(objType reflect.Type, _ interface{}) error {
+	klog.Errorf("Can not process add resource event, object type %s is not supported", objType)
 	return nil
 }
 
-func (bnc *BaseNetworkController) DeleteResourceCommon(objType reflect.Type, obj interface{}) error {
-	switch objType {
-	case factory.PolicyType:
-		knp, ok := obj.(*knet.NetworkPolicy)
-		if !ok {
-			return fmt.Errorf("could not cast obj of type %T to *knet.NetworkPolicy", obj)
-		}
-		return bnc.deleteNetworkPolicy(knp)
-	default:
-		klog.Errorf("Can not process delete resource event, object type %s is not supported", objType)
-	}
+func (bnc *BaseNetworkController) DeleteResourceCommon(objType reflect.Type, _ interface{}) error {
+	klog.Errorf("Can not process delete resource event, object type %s is not supported", objType)
 	return nil
 }
 

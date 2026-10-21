@@ -150,12 +150,6 @@ func (h *layer2UserDefinedNetworkControllerEventHandler) SyncFunc(objs []interfa
 		case factory.NamespaceType:
 			syncFunc = h.oc.syncNamespaces
 
-		case factory.PolicyType:
-			syncFunc = h.oc.syncNetworkPolicies
-
-		case factory.MultiNetworkPolicyType:
-			syncFunc = h.oc.syncMultiNetworkPolicies
-
 		default:
 			return fmt.Errorf("no sync function for object type %s", h.objType)
 		}
@@ -603,7 +597,6 @@ func (oc *Layer2UserDefinedNetworkController) initRetryFramework() {
 	// then watch for namespace and network policy events.
 	if oc.IsPrimaryNetwork() {
 		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
-		oc.retryNetworkPolicies = oc.newRetryFramework(factory.PolicyType)
 	}
 
 	// For secondary networks, we don't have to watch namespace events if
@@ -611,7 +604,6 @@ func (oc *Layer2UserDefinedNetworkController) initRetryFramework() {
 	// multi-network policy for IPAM-less secondary networks either.
 	if util.IsMultiNetworkPoliciesSupportEnabled() {
 		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
-		oc.retryMultiNetworkPolicies = oc.newRetryFramework(factory.MultiNetworkPolicyType)
 	}
 }
 

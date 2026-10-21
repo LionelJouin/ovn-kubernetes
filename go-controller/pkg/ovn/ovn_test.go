@@ -256,6 +256,9 @@ func (o *FakeOVN) shutdown() {
 	if o.controller != nil && o.controller.nodeReconciler != nil {
 		o.controller.nodeReconciler.Stop()
 	}
+	if o.controller != nil {
+		o.controller.StopNetworkPolicy()
+	}
 	o.watcher.Shutdown()
 	close(o.stopChan)
 	o.controller.cancelableCtx.Cancel()
@@ -271,6 +274,8 @@ func (o *FakeOVN) shutdown() {
 	}
 	o.nbsbCleanup.Cleanup()
 	for _, ocInfo := range o.userDefinedNetworkControllers {
+		ocInfo.bnc.StopNetworkPolicy()
+		ocInfo.bnc.StopMultiNetworkPolicy()
 		close(ocInfo.bnc.stopChan)
 		ocInfo.bnc.cancelableCtx.Cancel()
 		ocInfo.bnc.wg.Wait()

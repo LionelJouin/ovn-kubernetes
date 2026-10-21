@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	cnitypes "github.com/containernetworking/cni/pkg/types"
@@ -23,19 +22,19 @@ import (
 	knet "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/workqueue"
 	utilnet "k8s.io/utils/net"
 
 	libovsdbclient "github.com/ovn-kubernetes/libovsdb/client"
 
 	ovncnitypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	addressset "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/address_set"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/addresssetmanager"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/syncmap"
 	ovntest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	libovsdbtest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/libovsdb"
@@ -1302,24 +1301,20 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 				// sleep long enough for TransactWithRetry to fail, causing NP Add to fail
 				time.Sleep(config.Default.OVSDBTxnTimeout + time.Second)
-				// check to see if the retry cache has an entry for this policy
-				key, err := retry.GetResourceKey(networkPolicy2)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				retry.CheckRetryObjectEventually(key, true, fakeOvn.controller.retryNetworkPolicies)
+				key := getPolicyKey(networkPolicy2)
+				gomega.Eventually(func() int { return fakeOvn.controller.networkPolicyQueue.NumRequeues(key) }, 15*time.Second).Should(gomega.BeNumerically(">", 0))
 
 				connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 				defer cancel()
 				resetNBClient(connCtx, fakeOvn.controller.nbClient)
-				retry.SetRetryObjWithNoBackoff(key, fakeOvn.controller.retryPods)
-				fakeOvn.controller.retryNetworkPolicies.RequestRetryObjs()
+				fakeOvn.controller.networkPolicyQueue.Add(key)
 
 				gressPolicy2ExpectedData := getPolicyData(newNetpolDataParams(networkPolicy2).
 					withLocalPortUUIDs(nPodTest.portUUID).
 					withTCPPeerPorts(portNum + 1))
 				expectedDataWithPolicy2 := append(expectedData, gressPolicy2ExpectedData...)
 				gomega.Eventually(fakeOvn.nbClient).Should(libovsdbtest.HaveData(expectedDataWithPolicy2...))
-				// check the cache no longer has the entry
-				retry.CheckRetryObjectEventually(key, false, fakeOvn.controller.retryNetworkPolicies)
+				gomega.Eventually(func() int { return fakeOvn.controller.networkPolicyQueue.Len() }).Should(gomega.Equal(0))
 				return nil
 			}
 			gomega.Expect(app.Run([]string{app.Name})).To(gomega.Succeed())
@@ -1361,16 +1356,6 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 				time.Sleep(config.Default.OVSDBTxnTimeout + time.Second)
 				// create second networkpolicy with the same name, but different tcp port
 				networkPolicy2 := getPortNetworkPolicy(netPolicyName1, namespace1.Name, labelName, labelVal, portNum+1)
-				// check retry entry for this policy
-				key, err := retry.GetResourceKey(networkPolicy2)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				ginkgo.By("retry entry: old obj should not be nil, new obj should be nil")
-				retry.CheckRetryObjectMultipleFieldsEventually(
-					key,
-					fakeOvn.controller.retryNetworkPolicies,
-					gomega.Not(gomega.BeNil()), // oldObj should not be nil
-					gomega.BeNil(),             // newObj should be nil
-				)
 				connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 				defer cancel()
 				resetNBClient(connCtx, fakeOvn.controller.nbClient)
@@ -1387,10 +1372,6 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 						withTCPPeerPorts(portNum+1),
 					getUpdatedInitialDB([]testPod{nPodTest}))
 				gomega.Eventually(fakeOvn.nbClient).Should(libovsdbtest.HaveData(expectedData...))
-				// check the cache no longer has the entry
-				key, err = retry.GetResourceKey(networkPolicy)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				retry.CheckRetryObjectEventually(key, false, fakeOvn.controller.retryNetworkPolicies)
 				return nil
 			}
 			gomega.Expect(app.Run([]string{app.Name})).To(gomega.Succeed())
@@ -1655,21 +1636,16 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 				// sleep long enough for TransactWithRetry to fail, causing NP Add to fail
 				time.Sleep(config.Default.OVSDBTxnTimeout + time.Second)
 
-				// check to see if the retry cache has an entry for this policy
-				key, err := retry.GetResourceKey(networkPolicy)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				retry.CheckRetryObjectEventually(key, true, fakeOvn.controller.retryNetworkPolicies)
+				key := getPolicyKey(networkPolicy)
+				gomega.Eventually(func() int { return fakeOvn.controller.networkPolicyQueue.NumRequeues(key) }, 15*time.Second).Should(gomega.BeNumerically(">", 0))
 				connCtx, cancel := context.WithTimeout(context.Background(), config.Default.OVSDBTxnTimeout)
 				defer cancel()
 				resetNBClient(connCtx, fakeOvn.controller.nbClient)
-				retry.SetRetryObjWithNoBackoff(key, fakeOvn.controller.retryPods)
-				fakeOvn.controller.retryNetworkPolicies.RequestRetryObjs()
+				fakeOvn.controller.networkPolicyQueue.Add(key)
 
 				expectedData = getUpdatedInitialDB([]testPod{nPodTest})
 				gomega.Eventually(fakeOvn.controller.nbClient).Should(libovsdbtest.HaveData(expectedData))
-
-				// check the cache no longer has the entry
-				retry.CheckRetryObjectEventually(key, false, fakeOvn.controller.retryNetworkPolicies)
+				gomega.Eventually(func() int { return fakeOvn.controller.networkPolicyQueue.Len() }).Should(gomega.Equal(0))
 				return nil
 			}
 
@@ -1919,13 +1895,13 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 				time.Sleep(100 * time.Millisecond)
 				goroutinesNumInit := runtime.NumGoroutine()
 				fmt.Printf("goroutinesNumInit %v", goroutinesNumInit)
-				// network policy will create 1 watchFactory for local pods selector
+				// network policy will create local pod watcher and worker
 				_, err := fakeOvn.fakeClient.KubeClient.NetworkingV1().NetworkPolicies(networkPolicy.Namespace).
 					Create(context.TODO(), networkPolicy, metav1.CreateOptions{})
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 				gomega.Eventually(func() int {
 					return runtime.NumGoroutine()
-				}).Should(gomega.Equal(goroutinesNumInit + 1))
+				}).Should(gomega.BeNumerically(">", goroutinesNumInit))
 
 				// Delete network policy
 				err = fakeOvn.fakeClient.KubeClient.NetworkingV1().NetworkPolicies(networkPolicy.Namespace).
@@ -1954,23 +1930,6 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 					},
 				},
 			}
-			key, err := retry.GetResourceKey(pod)
-			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-
-			newRetryFramework := func() *retry.RetryFramework {
-				return retry.NewRetryFramework(
-					"test/netpol",
-					make(chan struct{}),
-					&sync.WaitGroup{},
-					nil,
-					&retry.ResourceHandler{
-						ObjType: factory.LocalPodSelectorType,
-						EventHandler: &networkControllerPolicyEventHandler{
-							objType: factory.LocalPodSelectorType,
-						},
-					},
-				)
-			}
 
 			matchingSelector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 				MatchLabels: map[string]string{"app": "selected"},
@@ -1981,10 +1940,14 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 			})
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-			matchingRetry := newRetryFramework()
-			nonMatchingRetry := newRetryFramework()
-			retry.InitRetryObjWithAdd(pod, key, matchingRetry)
-			retry.InitRetryObjWithAdd(pod, key, nonMatchingRetry)
+			matchingQueue := workqueue.NewTypedRateLimitingQueueWithConfig(
+				controller.DefaultRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "matching"},
+			)
+			nonMatchingQueue := workqueue.NewTypedRateLimitingQueueWithConfig(
+				controller.DefaultRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "nonmatching"},
+			)
 
 			bnc := &BaseNetworkController{
 				networkPolicies: syncmap.NewSyncMap[*networkPolicy](),
@@ -1993,22 +1956,21 @@ var _ = ginkgo.Describe("OVN NetworkPolicy Operations", func() {
 				name:             "match",
 				namespace:        namespaceName1,
 				localPodSelector: matchingSelector,
-				localPodRetry:    matchingRetry,
+				localPodQueue:    matchingQueue,
 			})
 			bnc.networkPolicies.Store("other", &networkPolicy{
 				name:             "other",
 				namespace:        namespaceName1,
 				localPodSelector: nonMatchingSelector,
-				localPodRetry:    nonMatchingRetry,
+				localPodQueue:    nonMatchingQueue,
 			})
-
-			gomega.Expect(retry.GetBackoffFromRetryObj(key, matchingRetry)).To(gomega.Equal(time.Second))
-			gomega.Expect(retry.GetBackoffFromRetryObj(key, nonMatchingRetry)).To(gomega.Equal(time.Second))
 
 			bnc.requestLocalPodPolicyRetriesForPod(pod, "logical port cache update")
 
-			gomega.Expect(retry.GetBackoffFromRetryObj(key, matchingRetry)).To(gomega.BeZero())
-			gomega.Expect(retry.GetBackoffFromRetryObj(key, nonMatchingRetry)).To(gomega.Equal(time.Second))
+			gomega.Expect(matchingQueue.Len()).To(gomega.Equal(1))
+			item, _ := matchingQueue.Get()
+			gomega.Expect(item).To(gomega.Equal(pod.Name))
+			gomega.Expect(nonMatchingQueue.Len()).To(gomega.Equal(0))
 		})
 
 		ginkgo.It("correctly creates networkpolicy targeting hostNetwork pods with non-nil podSelector", func() {

@@ -4,6 +4,7 @@
 package ovn
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -11,9 +12,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	knet "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 
@@ -21,12 +27,13 @@ import (
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics/recorders"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 	utilerrors "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util/errors"
@@ -166,11 +173,11 @@ type networkPolicy struct {
 	isEgress        bool
 
 	// network policy owns only 1 local pod handler
-	localPodHandler *factory.Handler
+	localPodHandler cache.ResourceEventHandlerRegistration
 	// localPodSelector mirrors the selector used by the local pod watcher.
 	localPodSelector labels.Selector
-	// retry framework for this policy's local pod selector watcher
-	localPodRetry *retry.RetryFramework
+	// localPodQueue is the workqueue for this policy's local pod events
+	localPodQueue workqueue.TypedRateLimitingInterface[string]
 	// peerAddressSets stores PodSelectorAddressSet keys for peers that this network policy was successfully added to.
 	// Required for cleanup.
 	peerAddressSets []string
@@ -207,6 +214,270 @@ func NewNetworkPolicy(policy *knet.NetworkPolicy) *networkPolicy {
 		localPods:       sync.Map{},
 	}
 	return np
+}
+
+// initNetworkPolicyHandlers initializes the rate-limiting workqueue and event handlers for network policies.
+func (bnc *BaseNetworkController) initNetworkPolicyHandlers() error {
+	if bnc.networkPolicyQueue != nil || bnc.watchFactory == nil {
+		return nil
+	}
+
+	bnc.networkPolicyQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: fmt.Sprintf("%s-networkpolicies", bnc.GetNetworkName())},
+	)
+
+	informer := bnc.watchFactory.NetworkPolicyInformer()
+	if informer == nil {
+		return fmt.Errorf("unable to get network policy informer")
+	}
+
+	handler, err := informer.AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    bnc.onNetworkPolicyAdd,
+			UpdateFunc: bnc.onNetworkPolicyUpdate,
+			DeleteFunc: bnc.onNetworkPolicyDelete,
+		}),
+	)
+	if err != nil {
+		bnc.StopNetworkPolicy()
+		return fmt.Errorf("unable to add network policy handler: %w", err)
+	}
+	bnc.networkPolicyHandler = handler
+
+	return nil
+}
+
+// WatchNetworkPolicy starts watching network policy resources and reconciles them via a rate-limiting workqueue.
+func (bnc *BaseNetworkController) WatchNetworkPolicy() error {
+	if bnc.networkPolicyQueue == nil {
+		if err := bnc.initNetworkPolicyHandlers(); err != nil {
+			return err
+		}
+	}
+
+	runCtx := wait.ContextForChannel(bnc.stopChan)
+	if bnc.watchFactory != nil {
+		policies, err := bnc.watchFactory.GetNetworkPolicies()
+		if err != nil {
+			return fmt.Errorf("failed to get network policies for initial sync: %w", err)
+		}
+		policyObjs := make([]interface{}, len(policies))
+		for i, p := range policies {
+			policyObjs[i] = p
+		}
+		if err := bnc.syncNetworkPolicies(policyObjs); err != nil {
+			return fmt.Errorf("failed to sync network policies: %w", err)
+		}
+	}
+
+	return bnc.WatchNetworkPoliciesWithWorkers(runCtx, 1)
+}
+
+func (bnc *BaseNetworkController) WatchNetworkPoliciesWithWorkers(ctx context.Context, workers int) error {
+	if bnc.networkPolicyQueue == nil {
+		return fmt.Errorf("networkPolicyQueue is not initialized")
+	}
+
+	go func() {
+		<-ctx.Done()
+		bnc.StopNetworkPolicy()
+	}()
+
+	for i := 0; i < workers; i++ {
+		bnc.wg.Add(1)
+		go func() {
+			defer bnc.wg.Done()
+			for bnc.processNetworkPolicyItem() {
+			}
+		}()
+	}
+
+	return nil
+}
+
+func (bnc *BaseNetworkController) runNetworkPolicyWorker(_ context.Context) {
+	for bnc.processNetworkPolicyItem() {
+	}
+}
+
+// StopNetworkPolicy shuts down the network policy queue, removes the event handler, and stops all local pod watchers.
+func (bnc *BaseNetworkController) StopNetworkPolicy() {
+	if bnc.networkPolicyQueue != nil {
+		bnc.networkPolicyQueue.ShutDown()
+	}
+	if bnc.networkPolicyHandler != nil && bnc.watchFactory != nil {
+		informer := bnc.watchFactory.NetworkPolicyInformer()
+		if informer != nil {
+			_ = informer.RemoveEventHandler(bnc.networkPolicyHandler)
+		}
+		bnc.networkPolicyHandler = nil
+	}
+	if bnc.networkPolicies != nil {
+		for _, npKey := range bnc.networkPolicies.GetKeys() {
+			if np, ok := bnc.networkPolicies.Load(npKey); ok && np != nil {
+				bnc.shutdownHandlers(np)
+			}
+		}
+	}
+}
+
+func (bnc *BaseNetworkController) onNetworkPolicyAdd(obj interface{}) {
+	policy, ok := obj.(*knet.NetworkPolicy)
+	if !ok {
+		return
+	}
+	if bnc.shouldFilterNamespace(policy.Namespace) {
+		return
+	}
+	key := getPolicyKey(policy)
+	klog.V(5).Infof("Recording add event on network policy %s", key)
+	recorders.GetConfigDurationRecorder().Start("networkpolicy", policy.Namespace, policy.Name)
+	bnc.networkPolicyQueue.Add(key)
+}
+
+func (bnc *BaseNetworkController) onNetworkPolicyUpdate(oldObj, newObj interface{}) {
+	oldPolicy, ok1 := oldObj.(*knet.NetworkPolicy)
+	newPolicy, ok2 := newObj.(*knet.NetworkPolicy)
+	if !ok1 || !ok2 {
+		return
+	}
+	if bnc.shouldFilterNamespace(newPolicy.Namespace) && bnc.shouldFilterNamespace(oldPolicy.Namespace) {
+		return
+	}
+	areEqual := apiequality.Semantic.DeepEqual(oldPolicy.Spec, newPolicy.Spec) &&
+		oldPolicy.Annotations[ovnStatelessNetPolAnnotationName] == newPolicy.Annotations[ovnStatelessNetPolAnnotationName]
+	if areEqual {
+		return
+	}
+	key := getPolicyKey(newPolicy)
+	klog.V(5).Infof("Recording update event on network policy %s", key)
+	recorders.GetConfigDurationRecorder().Start("networkpolicy", newPolicy.Namespace, newPolicy.Name)
+	bnc.networkPolicyQueue.Add(key)
+}
+
+func (bnc *BaseNetworkController) onNetworkPolicyDelete(obj interface{}) {
+	policy, ok := obj.(*knet.NetworkPolicy)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		policy, ok = tombstone.Obj.(*knet.NetworkPolicy)
+		if !ok {
+			return
+		}
+	}
+	if bnc.shouldFilterNamespace(policy.Namespace) {
+		return
+	}
+	key := getPolicyKey(policy)
+	klog.V(5).Infof("Recording delete event on network policy %s", key)
+	recorders.GetConfigDurationRecorder().Start("networkpolicy", policy.Namespace, policy.Name)
+	bnc.networkPolicyQueue.Add(key)
+}
+
+func (bnc *BaseNetworkController) processNetworkPolicyItem() bool {
+	key, shutdown := bnc.networkPolicyQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer bnc.networkPolicyQueue.Done(key)
+
+	select {
+	case <-bnc.stopChan:
+		return false
+	default:
+	}
+
+	err := bnc.reconcileNetworkPolicy(key)
+	if err != nil {
+		select {
+		case <-bnc.stopChan:
+			return false
+		default:
+		}
+		numRequeues := bnc.networkPolicyQueue.NumRequeues(key)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling network policy %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		} else {
+			klog.V(4).Infof("Error reconciling network policy %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		}
+		bnc.networkPolicyQueue.AddRateLimited(key)
+		return true
+	}
+	namespace, name, _ := cache.SplitMetaNamespaceKey(key)
+	recorders.GetConfigDurationRecorder().End("networkpolicy", namespace, name)
+	bnc.networkPolicyQueue.Forget(key)
+	return true
+}
+
+func (bnc *BaseNetworkController) shouldApplyNetworkPolicy(policy *knet.NetworkPolicy) (bool, error) {
+	if bnc.networkManager == nil {
+		return true, nil
+	}
+	foundNamespaceNAD, err := bnc.networkManager.GetPrimaryNADForNamespace(policy.Namespace)
+	if err != nil {
+		if bnc.GetNetworkName() == types.DefaultNetworkName && util.IsInvalidPrimaryNetworkError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("could not get primary network NAD for namespace %s: %w", policy.Namespace, err)
+	}
+	if foundNamespaceNAD == types.DefaultNetworkName {
+		if bnc.GetNetworkName() != types.DefaultNetworkName {
+			return false, nil
+		}
+	} else {
+		networkName := bnc.networkManager.GetNetworkNameForNADKey(foundNamespaceNAD)
+		if networkName == "" {
+			return false, fmt.Errorf("no primary network found for namespace %s", policy.Namespace)
+		}
+		if bnc.GetNetworkName() != networkName {
+			return false, nil
+		}
+	}
+	netInfo, err := bnc.networkManager.GetActiveNetworkForNamespace(policy.Namespace)
+	if err != nil {
+		return false, fmt.Errorf("could not get active network for namespace %s: %w", policy.Namespace, err)
+	}
+	if netInfo == nil || bnc.GetNetworkName() != netInfo.GetNetworkName() {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (bnc *BaseNetworkController) reconcileNetworkPolicy(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	curPolicy, err := bnc.watchFactory.GetNetworkPolicy(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return bnc.deleteNetworkPolicy(&knet.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      name,
+				},
+			})
+		}
+		return fmt.Errorf("failed to get network policy %s: %w", key, err)
+	}
+
+	if bnc.shouldFilterNamespace(curPolicy.Namespace) {
+		return bnc.deleteNetworkPolicy(curPolicy)
+	}
+
+	shouldApply, err := bnc.shouldApplyNetworkPolicy(curPolicy)
+	if err != nil {
+		return err
+	}
+	if !shouldApply {
+		return bnc.deleteNetworkPolicy(curPolicy)
+	}
+
+	return bnc.addNetworkPolicy(curPolicy)
 }
 
 func (bnc *BaseNetworkController) syncNetworkPolicies(networkPolicies []interface{}) error {
@@ -880,46 +1151,248 @@ func (bnc *BaseNetworkController) handleLocalPodSelectorDelFunc(np *networkPolic
 	return nil
 }
 
-// This function starts a watcher for local pods. Sync function and add event for every existing pod
-// will be executed sequentially first, and an error will be returned if something fails.
-// LocalPodSelectorType uses handleLocalPodSelectorAddFunc on Add and Update,
-// and handleLocalPodSelectorDelFunc on Delete.
+// addLocalPodHandler starts a watcher for local pods for the given network policy.
 func (bnc *BaseNetworkController) addLocalPodHandler(policy *knet.NetworkPolicy, np *networkPolicy) error {
-	// NetworkPolicy is validated by the apiserver
 	sel, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
 	if err != nil {
 		klog.Errorf("Could not set up watcher for local pods: %v", err)
 		return err
 	}
 
-	// Add all local pods in a syncFunction to minimize db ops.
-	syncFunc := func(objs []interface{}) error {
-		// ignore returned error, since any pod that wasn't properly handled will be retried individually.
-		_ = bnc.handleLocalPodSelectorAddFunc(np, objs...)
-		return nil
-	}
-	retryLocalPods := bnc.newNetpolRetryFramework(
-		factory.LocalPodSelectorType,
-		syncFunc,
-		&NetworkPolicyExtraParameters{
-			np: np,
-		},
-		np.cancelableContext.Done())
-
-	podHandler, err := retryLocalPods.WatchResourceFiltered(policy.Namespace, sel)
-	if err != nil {
-		klog.Errorf("WatchResource failed for addLocalPodHandler: %v", err)
-		return err
-	}
-
-	np.localPodHandler = podHandler
 	np.localPodSelector = sel
-	np.localPodRetry = retryLocalPods
+	np.localPodQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: fmt.Sprintf("%s/%s-localpods", np.namespace, np.name)},
+	)
+
+	// Add all existing local pods matching the selector to minimize db ops.
+	if bnc.watchFactory != nil {
+		existingPods, err := bnc.watchFactory.GetPods(policy.Namespace)
+		if err == nil {
+			var matchingPods []interface{}
+			for _, pod := range existingPods {
+				if sel.Matches(labels.Set(pod.Labels)) && !util.PodCompleted(pod) {
+					matchingPods = append(matchingPods, pod)
+				}
+			}
+			if len(matchingPods) > 0 {
+				_ = bnc.handleLocalPodSelectorAddFunc(np, matchingPods...)
+				for _, obj := range matchingPods {
+					pod := obj.(*corev1.Pod)
+					nadKeys := bnc.getPodNADKeys(pod)
+					allAdded := true
+					for _, nadKey := range nadKeys {
+						portName := bnc.GetLogicalPortName(pod, nadKey)
+						if _, ok := np.localPods.Load(portName); !ok {
+							allAdded = false
+							break
+						}
+					}
+					if !allAdded {
+						np.localPodQueue.AddRateLimited(pod.Name)
+					}
+				}
+			}
+		}
+	}
+
+	podInformer := bnc.watchFactory.PodInformer()
+	if podInformer == nil {
+		return fmt.Errorf("pod informer is nil")
+	}
+
+	handler, err := podInformer.AddEventHandler(
+		cache.FilteringResourceEventHandler{
+			FilterFunc: func(obj interface{}) bool {
+				pod, ok := obj.(*corev1.Pod)
+				if !ok {
+					tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+					if !ok {
+						return false
+					}
+					pod, ok = tombstone.Obj.(*corev1.Pod)
+					if !ok {
+						return false
+					}
+				}
+				return pod.Namespace == policy.Namespace
+			},
+			Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc: func(obj interface{}) {
+					bnc.onLocalPodAdd(np, obj)
+				},
+				UpdateFunc: func(oldObj, newObj interface{}) {
+					bnc.onLocalPodUpdate(np, oldObj, newObj)
+				},
+				DeleteFunc: func(obj interface{}) {
+					bnc.onLocalPodDelete(np, obj)
+				},
+			},
+		},
+	)
+	if err != nil {
+		np.localPodQueue.ShutDown()
+		return fmt.Errorf("failed to add local pod handler for network policy %s: %w", np.getKey(), err)
+	}
+
+	np.localPodHandler = handler
+
+	bnc.wg.Add(1)
+	go func() {
+		defer bnc.wg.Done()
+		bnc.runLocalPodWorker(np)
+	}()
+
+	var doneChan <-chan struct{}
+	if np.cancelableContext != nil {
+		doneChan = np.cancelableContext.Done()
+	}
+	go func() {
+		select {
+		case <-bnc.stopChan:
+		case <-doneChan:
+		}
+		if np.localPodQueue != nil {
+			np.localPodQueue.ShutDown()
+		}
+	}()
+
 	return nil
 }
 
+func (bnc *BaseNetworkController) runLocalPodWorker(np *networkPolicy) {
+	for bnc.processLocalPodItem(np) {
+	}
+}
+
+func (bnc *BaseNetworkController) processLocalPodItem(np *networkPolicy) bool {
+	name, shutdown := np.localPodQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer np.localPodQueue.Done(name)
+
+	select {
+	case <-bnc.stopChan:
+		return false
+	default:
+	}
+
+	np.RLock()
+	deleted := np.deleted
+	np.RUnlock()
+	if deleted {
+		return true
+	}
+
+	err := bnc.reconcileLocalPod(np, name)
+	if err != nil {
+		select {
+		case <-bnc.stopChan:
+			return false
+		default:
+		}
+		np.RLock()
+		deleted := np.deleted
+		np.RUnlock()
+		if deleted {
+			return true
+		}
+		numRequeues := np.localPodQueue.NumRequeues(name)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling local pod %s for network policy %s (attempt %d): %v, requeuing",
+				name, np.getKey(), numRequeues, err)
+		} else {
+			klog.V(5).Infof("Error reconciling local pod %s for network policy %s (attempt %d): %v, requeuing",
+				name, np.getKey(), numRequeues, err)
+		}
+		np.localPodQueue.AddRateLimited(name)
+		return true
+	}
+	np.localPodQueue.Forget(name)
+	return true
+}
+
+func (bnc *BaseNetworkController) reconcileLocalPod(np *networkPolicy, name string) error {
+	curPod, err := bnc.watchFactory.GetPod(np.namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return bnc.handleLocalPodSelectorDelFunc(np, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: np.namespace,
+					Name:      name,
+				},
+			})
+		}
+		return fmt.Errorf("failed to get pod %s/%s: %w", np.namespace, name, err)
+	}
+
+	if util.PodCompleted(curPod) {
+		return bnc.handleLocalPodSelectorDelFunc(np, curPod)
+	}
+
+	np.RLock()
+	matches := np.localPodSelector != nil && np.localPodSelector.Matches(labels.Set(curPod.Labels))
+	np.RUnlock()
+
+	if !matches {
+		return bnc.handleLocalPodSelectorDelFunc(np, curPod)
+	}
+
+	return bnc.handleLocalPodSelectorAddFunc(np, curPod)
+}
+
+func (bnc *BaseNetworkController) onLocalPodAdd(np *networkPolicy, obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	np.RLock()
+	matches := np.localPodSelector != nil && np.localPodSelector.Matches(labels.Set(pod.Labels))
+	np.RUnlock()
+	if !matches {
+		return
+	}
+	np.localPodQueue.Add(pod.Name)
+}
+
+func (bnc *BaseNetworkController) onLocalPodUpdate(np *networkPolicy, oldObj, newObj interface{}) {
+	oldPod, ok1 := oldObj.(*corev1.Pod)
+	newPod, ok2 := newObj.(*corev1.Pod)
+	if !ok1 || !ok2 {
+		return
+	}
+	np.RLock()
+	selector := np.localPodSelector
+	np.RUnlock()
+	if selector == nil {
+		return
+	}
+	oldMatches := selector.Matches(labels.Set(oldPod.Labels))
+	newMatches := selector.Matches(labels.Set(newPod.Labels))
+	if !oldMatches && !newMatches {
+		return
+	}
+	np.localPodQueue.Add(newPod.Name)
+}
+
+func (bnc *BaseNetworkController) onLocalPodDelete(np *networkPolicy, obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+	np.localPodQueue.Add(pod.Name)
+}
+
 // requestLocalPodPolicyRetriesForPod requests immediate retries for local pod
-// selector handlers that currently have a failed retry entry for this pod.
+// selector handlers for this pod.
 func (bnc *BaseNetworkController) requestLocalPodPolicyRetriesForPod(pod *corev1.Pod, reason string) {
 	if bnc.networkPolicies == nil || pod == nil {
 		return
@@ -931,22 +1404,15 @@ func (bnc *BaseNetworkController) requestLocalPodPolicyRetriesForPod(pod *corev1
 		}
 		np.RLock()
 		localPodSelector := np.localPodSelector
-		retryLocalPods := np.localPodRetry
+		localPodQueue := np.localPodQueue
 		deleted := np.deleted
 		np.RUnlock()
-		if deleted || retryLocalPods == nil || localPodSelector == nil || !localPodSelector.Matches(labels.Set(pod.Labels)) {
+		if deleted || localPodQueue == nil || localPodSelector == nil || !localPodSelector.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
-		requested, err := retryLocalPods.RequestRetryObjWithNoBackoff(pod)
-		if err != nil {
-			klog.Warningf("Failed to request immediate localPodSelector retry for network policy %s, pod %s/%s: %v",
-				npKey, pod.Namespace, pod.Name, err)
-			continue
-		}
-		if requested {
-			klog.V(5).Infof("Requested immediate localPodSelector retry for network policy %s, pod %s/%s due to %s",
-				npKey, pod.Namespace, pod.Name, reason)
-		}
+		localPodQueue.Add(pod.Name)
+		klog.V(5).Infof("Requested immediate local pod retry for network policy %s, pod %s/%s due to %s",
+			npKey, pod.Namespace, pod.Name, reason)
 	}
 }
 
@@ -1395,21 +1861,22 @@ func (bnc *BaseNetworkController) cleanupNetworkPolicy(np *networkPolicy) error 
 	return nil
 }
 
-type NetworkPolicyExtraParameters struct {
-	np *networkPolicy
-}
-
 func (bnc *BaseNetworkController) shutdownHandlers(np *networkPolicy) {
 	if np.cancelableContext != nil {
 		np.cancelableContext.Cancel()
 		np.cancelableContext = nil
 	}
 
-	if np.localPodHandler != nil {
-		bnc.watchFactory.RemovePodHandler(np.localPodHandler)
+	if np.localPodHandler != nil && bnc.watchFactory != nil {
+		informer := bnc.watchFactory.PodInformer()
+		if informer != nil {
+			_ = informer.RemoveEventHandler(np.localPodHandler)
+		}
 		np.localPodHandler = nil
 		np.localPodSelector = nil
-		np.localPodRetry = nil
+	}
+	if np.localPodQueue != nil {
+		np.localPodQueue.ShutDown()
 	}
 }
 

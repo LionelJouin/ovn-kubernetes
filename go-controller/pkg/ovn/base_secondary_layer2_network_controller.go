@@ -39,12 +39,8 @@ func (oc *BaseLayer2UserDefinedNetworkController) stop() {
 	oc.cancelableCtx.Cancel()
 	oc.wg.Wait()
 
-	if oc.netPolicyHandler != nil {
-		oc.watchFactory.RemovePolicyHandler(oc.netPolicyHandler)
-	}
-	if oc.multiNetPolicyHandler != nil {
-		oc.watchFactory.RemoveMultiNetworkPolicyHandler(oc.multiNetPolicyHandler)
-	}
+	oc.StopNetworkPolicy()
+	oc.StopMultiNetworkPolicy()
 	if oc.podHandler != nil {
 		oc.watchFactory.RemovePodHandler(oc.podHandler)
 	}

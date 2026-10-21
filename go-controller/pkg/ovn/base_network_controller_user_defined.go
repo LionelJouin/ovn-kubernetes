@@ -4,6 +4,7 @@
 package ovn
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"reflect"
@@ -14,7 +15,13 @@ import (
 	nadapi "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 
 	corev1 "k8s.io/api/core/v1"
+	knet "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 	"k8s.io/utils/ptr"
@@ -23,12 +30,14 @@ import (
 	"github.com/ovn-kubernetes/libovsdb/ovsdb"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/generator/udn"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kubevirt"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics/recorders"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	addressset "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/address_set"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/addresssetmanager"
@@ -77,26 +86,6 @@ func (bsnc *BaseUserDefinedNetworkController) AddUserDefinedNetworkResourceCommo
 		}
 		return bsnc.AddNamespaceForUserDefinedNetwork(ns)
 
-	case factory.MultiNetworkPolicyType:
-		mp, ok := obj.(*mnpapi.MultiNetworkPolicy)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *multinetworkpolicyapi.MultiNetworkPolicy", obj)
-		}
-
-		if !bsnc.shouldApplyMultiPolicy(mp) {
-			return nil
-		}
-
-		np, err := bsnc.convertMultiNetPolicyToNetPolicy(mp)
-		if err != nil {
-			return err
-		}
-		if err := bsnc.addNetworkPolicy(np); err != nil {
-			klog.Infof("MultiNetworkPolicy add failed for %s/%s, will try again later: %v",
-				mp.Namespace, mp.Name, err)
-			return err
-		}
-
 	default:
 		return bsnc.AddResourceCommon(objType, obj)
 	}
@@ -122,43 +111,6 @@ func (bsnc *BaseUserDefinedNetworkController) UpdateUserDefinedNetworkResourceCo
 		oldNs, newNs := oldObj.(*corev1.Namespace), newObj.(*corev1.Namespace)
 		return bsnc.updateNamespaceForUserDefinedNetwork(oldNs, newNs)
 
-	case factory.MultiNetworkPolicyType:
-		oldMp, ok := oldObj.(*mnpapi.MultiNetworkPolicy)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *multinetworkpolicyapi.MultiNetworkPolicy", oldObj)
-		}
-		newMp, ok := newObj.(*mnpapi.MultiNetworkPolicy)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *multinetworkpolicyapi.MultiNetworkPolicy", newObj)
-		}
-
-		oldShouldApply := bsnc.shouldApplyMultiPolicy(oldMp)
-		newShouldApply := bsnc.shouldApplyMultiPolicy(newMp)
-		if oldShouldApply {
-			// this multi-netpol no longer applies to this network controller, delete it
-			np, err := bsnc.convertMultiNetPolicyToNetPolicy(oldMp)
-			if err != nil {
-				return err
-			}
-			if err := bsnc.deleteNetworkPolicy(np); err != nil {
-				klog.Infof("MultiNetworkPolicy delete failed for %s/%s, will try again later: %v",
-					oldMp.Namespace, oldMp.Name, err)
-				return err
-			}
-		}
-		if newShouldApply {
-			// now this multi-netpol applies to this network controller
-			np, err := bsnc.convertMultiNetPolicyToNetPolicy(newMp)
-			if err != nil {
-				return err
-			}
-			if err := bsnc.addNetworkPolicy(np); err != nil {
-				klog.Infof("MultiNetworkPolicy add failed for %s/%s, will try again later: %v",
-					newMp.Namespace, newMp.Name, err)
-				return err
-			}
-		}
-
 	default:
 		return fmt.Errorf("object type %s not supported", objType)
 	}
@@ -183,22 +135,6 @@ func (bsnc *BaseUserDefinedNetworkController) DeleteUserDefinedNetworkResourceCo
 	case factory.NamespaceType:
 		ns := obj.(*corev1.Namespace)
 		return bsnc.deleteNamespaceForUserDefinedNetwork(ns)
-
-	case factory.MultiNetworkPolicyType:
-		mp, ok := obj.(*mnpapi.MultiNetworkPolicy)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *multinetworkpolicyapi.MultiNetworkPolicy", obj)
-		}
-		np, err := bsnc.convertMultiNetPolicyToNetPolicy(mp)
-		if err != nil {
-			return err
-		}
-		// delete this policy regardless it applies to this network controller, in case of missing update event
-		if err := bsnc.deleteNetworkPolicy(np); err != nil {
-			klog.Infof("MultiNetworkPolicy delete failed for %s/%s, will try again later: %v",
-				mp.Namespace, mp.Name, err)
-			return err
-		}
 
 	default:
 		return bsnc.DeleteResourceCommon(objType, obj)
@@ -675,32 +611,239 @@ func (bsnc *BaseUserDefinedNetworkController) deleteNamespaceForUserDefinedNetwo
 	return nil
 }
 
-// WatchNetworkPolicy starts the watching of networkpolicy resource and calls
+// WatchNetworkPolicy starts watching networkpolicy resources and calls
 // back the appropriate handler logic
 func (bsnc *BaseUserDefinedNetworkController) WatchNetworkPolicy() error {
-	if bsnc.netPolicyHandler != nil {
+	return bsnc.BaseNetworkController.WatchNetworkPolicy()
+}
+
+// initMultiNetworkPolicyHandlers initializes the rate-limiting workqueue and event handlers for multi-network policies.
+func (bsnc *BaseUserDefinedNetworkController) initMultiNetworkPolicyHandlers() error {
+	if bsnc.multiNetworkPolicyQueue != nil || bsnc.watchFactory == nil {
 		return nil
 	}
-	handler, err := bsnc.retryNetworkPolicies.WatchResource()
-	if err != nil {
-		return err
+
+	bsnc.multiNetworkPolicyQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: fmt.Sprintf("%s-multinetworkpolicies", bsnc.GetNetworkName())},
+	)
+
+	informer := bsnc.watchFactory.MultiNetworkPolicyInformer()
+	if informer == nil {
+		return fmt.Errorf("unable to get multi-network policy informer")
 	}
-	bsnc.netPolicyHandler = handler
+
+	handler, err := informer.AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    bsnc.onMultiNetworkPolicyAdd,
+			UpdateFunc: bsnc.onMultiNetworkPolicyUpdate,
+			DeleteFunc: bsnc.onMultiNetworkPolicyDelete,
+		}),
+	)
+	if err != nil {
+		bsnc.StopMultiNetworkPolicy()
+		return fmt.Errorf("unable to add multi-network policy handler: %w", err)
+	}
+	bsnc.multiNetPolicyHandler = handler
+
 	return nil
 }
 
-// WatchMultiNetworkPolicy starts the watching of multinetworkpolicy resource and calls
+// WatchMultiNetworkPolicy starts watching multinetworkpolicy resources and calls
 // back the appropriate handler logic
 func (bsnc *BaseUserDefinedNetworkController) WatchMultiNetworkPolicy() error {
-	if bsnc.multiNetPolicyHandler != nil {
-		return nil
+	if bsnc.multiNetworkPolicyQueue == nil {
+		if err := bsnc.initMultiNetworkPolicyHandlers(); err != nil {
+			return err
+		}
 	}
-	handler, err := bsnc.retryMultiNetworkPolicies.WatchResource()
+
+	runCtx := wait.ContextForChannel(bsnc.stopChan)
+	if bsnc.watchFactory != nil {
+		policies, err := bsnc.watchFactory.GetMultiNetworkPolicies()
+		if err != nil {
+			return fmt.Errorf("failed to get multi-network policies for initial sync: %w", err)
+		}
+		policyObjs := make([]interface{}, len(policies))
+		for i, p := range policies {
+			policyObjs[i] = p
+		}
+		if err := bsnc.syncMultiNetworkPolicies(policyObjs); err != nil {
+			return fmt.Errorf("failed to sync multi-network policies: %w", err)
+		}
+	}
+
+	return bsnc.WatchMultiNetworkPoliciesWithWorkers(runCtx, 1)
+}
+
+func (bsnc *BaseUserDefinedNetworkController) WatchMultiNetworkPoliciesWithWorkers(ctx context.Context, workers int) error {
+	if bsnc.multiNetworkPolicyQueue == nil {
+		return fmt.Errorf("multiNetworkPolicyQueue is not initialized")
+	}
+
+	go func() {
+		<-ctx.Done()
+		bsnc.StopMultiNetworkPolicy()
+	}()
+
+	for i := 0; i < workers; i++ {
+		bsnc.wg.Add(1)
+		go func() {
+			defer bsnc.wg.Done()
+			for bsnc.processMultiNetworkPolicyItem() {
+			}
+		}()
+	}
+
+	return nil
+}
+
+func (bsnc *BaseUserDefinedNetworkController) runMultiNetworkPolicyWorker(_ context.Context) {
+	for bsnc.processMultiNetworkPolicyItem() {
+	}
+}
+
+// StopMultiNetworkPolicy shuts down the multi-network policy queue and removes the event handler.
+func (bsnc *BaseUserDefinedNetworkController) StopMultiNetworkPolicy() {
+	if bsnc.multiNetworkPolicyQueue != nil {
+		bsnc.multiNetworkPolicyQueue.ShutDown()
+	}
+	if bsnc.multiNetPolicyHandler != nil && bsnc.watchFactory != nil {
+		informer := bsnc.watchFactory.MultiNetworkPolicyInformer()
+		if informer != nil {
+			_ = informer.RemoveEventHandler(bsnc.multiNetPolicyHandler)
+		}
+		bsnc.multiNetPolicyHandler = nil
+	}
+}
+
+func (bsnc *BaseUserDefinedNetworkController) onMultiNetworkPolicyAdd(obj interface{}) {
+	policy, ok := obj.(*mnpapi.MultiNetworkPolicy)
+	if !ok {
+		return
+	}
+	if !bsnc.shouldApplyMultiPolicy(policy) {
+		return
+	}
+	key := fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
+	klog.V(5).Infof("Recording add event on multinetwork policy %s", key)
+	recorders.GetConfigDurationRecorder().Start("multinetworkpolicy", policy.Namespace, policy.Name)
+	bsnc.multiNetworkPolicyQueue.Add(key)
+}
+
+func (bsnc *BaseUserDefinedNetworkController) onMultiNetworkPolicyUpdate(oldObj, newObj interface{}) {
+	oldPolicy, ok1 := oldObj.(*mnpapi.MultiNetworkPolicy)
+	newPolicy, ok2 := newObj.(*mnpapi.MultiNetworkPolicy)
+	if !ok1 || !ok2 {
+		return
+	}
+	oldApplies := bsnc.shouldApplyMultiPolicy(oldPolicy)
+	newApplies := bsnc.shouldApplyMultiPolicy(newPolicy)
+	if !oldApplies && !newApplies {
+		return
+	}
+	if oldApplies && newApplies {
+		areEqual := apiequality.Semantic.DeepEqual(oldPolicy.Spec, newPolicy.Spec) &&
+			oldPolicy.Annotations[ovnStatelessNetPolAnnotationName] == newPolicy.Annotations[ovnStatelessNetPolAnnotationName] &&
+			oldPolicy.Annotations[PolicyForAnnotation] == newPolicy.Annotations[PolicyForAnnotation]
+		if areEqual {
+			return
+		}
+	}
+	key := fmt.Sprintf("%s/%s", newPolicy.Namespace, newPolicy.Name)
+	klog.V(5).Infof("Recording update event on multinetwork policy %s", key)
+	recorders.GetConfigDurationRecorder().Start("multinetworkpolicy", newPolicy.Namespace, newPolicy.Name)
+	bsnc.multiNetworkPolicyQueue.Add(key)
+}
+
+func (bsnc *BaseUserDefinedNetworkController) onMultiNetworkPolicyDelete(obj interface{}) {
+	policy, ok := obj.(*mnpapi.MultiNetworkPolicy)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		policy, ok = tombstone.Obj.(*mnpapi.MultiNetworkPolicy)
+		if !ok {
+			return
+		}
+	}
+	key := fmt.Sprintf("%s/%s", policy.Namespace, policy.Name)
+	klog.V(5).Infof("Recording delete event on multinetwork policy %s", key)
+	recorders.GetConfigDurationRecorder().Start("multinetworkpolicy", policy.Namespace, policy.Name)
+	bsnc.multiNetworkPolicyQueue.Add(key)
+}
+
+func (bsnc *BaseUserDefinedNetworkController) processMultiNetworkPolicyItem() bool {
+	key, shutdown := bsnc.multiNetworkPolicyQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer bsnc.multiNetworkPolicyQueue.Done(key)
+
+	select {
+	case <-bsnc.stopChan:
+		return false
+	default:
+	}
+
+	err := bsnc.reconcileMultiNetworkPolicy(key)
+	if err != nil {
+		select {
+		case <-bsnc.stopChan:
+			return false
+		default:
+		}
+		numRequeues := bsnc.multiNetworkPolicyQueue.NumRequeues(key)
+		if numRequeues >= 5 {
+			klog.Warningf("Persistent error reconciling multi-network policy %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		} else {
+			klog.V(4).Infof("Error reconciling multi-network policy %s (attempt %d): %v, requeuing", key, numRequeues, err)
+		}
+		bsnc.multiNetworkPolicyQueue.AddRateLimited(key)
+		return true
+	}
+	namespace, name, _ := cache.SplitMetaNamespaceKey(key)
+	recorders.GetConfigDurationRecorder().End("multinetworkpolicy", namespace, name)
+	bsnc.multiNetworkPolicyQueue.Forget(key)
+	return true
+}
+
+func (bsnc *BaseUserDefinedNetworkController) reconcileMultiNetworkPolicy(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	curPolicy, err := bsnc.watchFactory.GetMultiNetworkPolicy(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			dummyNP := &knet.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      name,
+				},
+			}
+			return bsnc.deleteNetworkPolicy(dummyNP)
+		}
+		return fmt.Errorf("failed to get multi-network policy %s: %w", key, err)
+	}
+
+	if !bsnc.shouldApplyMultiPolicy(curPolicy) {
+		dummyNP := &knet.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+				Name:      name,
+			},
+		}
+		return bsnc.deleteNetworkPolicy(dummyNP)
+	}
+
+	np, err := bsnc.convertMultiNetPolicyToNetPolicy(curPolicy)
 	if err != nil {
 		return err
 	}
-	bsnc.multiNetPolicyHandler = handler
-	return nil
+	return bsnc.addNetworkPolicy(np)
 }
 
 // cleanupGatewayRoutersForNetworkFromDB discovers all gateway routers for the given network from

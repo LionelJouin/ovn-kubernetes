@@ -10,15 +10,12 @@ import (
 	"sync"
 	"time"
 
-	mnpapi "github.com/k8snetworkplumbingwg/multi-networkpolicy/pkg/apis/k8s.cni.cncf.io/v1beta1"
-
 	"k8s.io/klog/v2"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/pod"
 	nodecontroller "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
-	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics/recorders"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/networkmanager"
 	addressset "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/address_set"
@@ -68,13 +65,7 @@ func (h *LocalnetUserDefinedNetworkControllerEventHandler) GetResourceFromInform
 }
 
 // RecordAddEvent records the add event on this given object.
-func (h *LocalnetUserDefinedNetworkControllerEventHandler) RecordAddEvent(obj interface{}) {
-	switch h.objType {
-	case factory.MultiNetworkPolicyType:
-		mnp := obj.(*mnpapi.MultiNetworkPolicy)
-		klog.V(5).Infof("Recording add event on multinetwork policy %s/%s", mnp.Namespace, mnp.Name)
-		recorders.GetConfigDurationRecorder().Start("multinetworkpolicy", mnp.Namespace, mnp.Name)
-	}
+func (h *LocalnetUserDefinedNetworkControllerEventHandler) RecordAddEvent(_ interface{}) {
 }
 
 // RecordUpdateEvent records the udpate event on this given object.
@@ -137,9 +128,6 @@ func (h *LocalnetUserDefinedNetworkControllerEventHandler) SyncFunc(objs []inter
 
 		case factory.NamespaceType:
 			syncFunc = h.oc.syncNamespaces
-
-		case factory.MultiNetworkPolicyType:
-			syncFunc = h.oc.syncMultiNetworkPolicies
 
 		default:
 			return fmt.Errorf("no sync function for object type %s", h.objType)
@@ -301,7 +289,6 @@ func (oc *LocalnetUserDefinedNetworkController) initRetryFramework() {
 	// multi-network policy for IPAM-less secondary networks either.
 	if util.IsMultiNetworkPoliciesSupportEnabled() {
 		oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
-		oc.retryMultiNetworkPolicies = oc.newRetryFramework(factory.MultiNetworkPolicyType)
 	}
 }
 

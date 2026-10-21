@@ -11,7 +11,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	knet "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -267,6 +266,9 @@ func newDefaultNetworkControllerCommon(
 
 	oc.ovnClusterLRPToJoinIfAddrs = gwLRPIfAddrs
 
+	if err := oc.initNetworkPolicyHandlers(); err != nil {
+		return nil, err
+	}
 	oc.initRetryFramework()
 	if oc.eIPC != nil {
 		oc.eIPC.retryEgressIPPods = oc.retryEgressIPPods
@@ -275,6 +277,9 @@ func newDefaultNetworkControllerCommon(
 }
 
 func (oc *DefaultNetworkController) initRetryFramework() {
+	oc.onLogicalPortCacheAdd = func(pod *corev1.Pod, _ string) {
+		oc.requestLocalPodPolicyRetriesForPod(pod, "logical port cache add")
+	}
 	// Init the retry framework for pods, namespaces, network policies, egress firewalls,
 	// egress IP (and dependent namespaces, pods, nodes), cloud private ip config.
 	oc.retryPods = oc.newRetryFramework(factory.PodType)
@@ -283,7 +288,6 @@ func (oc *DefaultNetworkController) initRetryFramework() {
 	oc.retryEgressIPPods = oc.newRetryFramework(factory.EgressIPPodType)
 	oc.retryEgressNodes = oc.newRetryFramework(factory.EgressNodeType)
 	oc.retryNamespaces = oc.newRetryFramework(factory.NamespaceType)
-	oc.retryNetworkPolicies = oc.newRetryFramework(factory.PolicyType)
 }
 
 // newRetryFramework builds and returns a retry framework for the input resource
@@ -374,6 +378,7 @@ func (oc *DefaultNetworkController) Stop() {
 	if oc.uplinkStateController != nil {
 		oc.uplinkStateController.Stop()
 	}
+	oc.StopNetworkPolicy()
 
 	close(oc.stopChan)
 	oc.cancelableCtx.Cancel()
@@ -935,10 +940,6 @@ func (h *defaultNetworkControllerEventHandler) RecordAddEvent(obj interface{}) {
 		klog.V(5).Infof("Recording add event on pod %s/%s", pod.Namespace, pod.Name)
 		h.oc.podRecorder.AddPod(pod.UID)
 		recorders.GetConfigDurationRecorder().Start("pod", pod.Namespace, pod.Name)
-	case factory.PolicyType:
-		np := obj.(*knet.NetworkPolicy)
-		klog.V(5).Infof("Recording add event on network policy %s/%s", np.Namespace, np.Name)
-		recorders.GetConfigDurationRecorder().Start("networkpolicy", np.Namespace, np.Name)
 	}
 }
 
@@ -949,10 +950,6 @@ func (h *defaultNetworkControllerEventHandler) RecordUpdateEvent(obj interface{}
 		pod := obj.(*corev1.Pod)
 		klog.V(5).Infof("Recording update event on pod %s/%s", pod.Namespace, pod.Name)
 		recorders.GetConfigDurationRecorder().Start("pod", pod.Namespace, pod.Name)
-	case factory.PolicyType:
-		np := obj.(*knet.NetworkPolicy)
-		klog.V(5).Infof("Recording update event on network policy %s/%s", np.Namespace, np.Name)
-		recorders.GetConfigDurationRecorder().Start("networkpolicy", np.Namespace, np.Name)
 	}
 }
 
@@ -964,10 +961,6 @@ func (h *defaultNetworkControllerEventHandler) RecordDeleteEvent(obj interface{}
 		klog.V(5).Infof("Recording delete event on pod %s/%s", pod.Namespace, pod.Name)
 		h.oc.podRecorder.CleanPod(pod.UID)
 		recorders.GetConfigDurationRecorder().Start("pod", pod.Namespace, pod.Name)
-	case factory.PolicyType:
-		np := obj.(*knet.NetworkPolicy)
-		klog.V(5).Infof("Recording delete event on network policy %s/%s", np.Namespace, np.Name)
-		recorders.GetConfigDurationRecorder().Start("networkpolicy", np.Namespace, np.Name)
 	}
 }
 
@@ -978,10 +971,6 @@ func (h *defaultNetworkControllerEventHandler) RecordSuccessEvent(obj interface{
 		pod := obj.(*corev1.Pod)
 		klog.V(5).Infof("Recording success event on pod %s/%s", pod.Namespace, pod.Name)
 		recorders.GetConfigDurationRecorder().End("pod", pod.Namespace, pod.Name)
-	case factory.PolicyType:
-		np := obj.(*knet.NetworkPolicy)
-		klog.V(5).Infof("Recording success event on network policy %s/%s", np.Namespace, np.Name)
-		recorders.GetConfigDurationRecorder().End("networkpolicy", np.Namespace, np.Name)
 	}
 }
 
@@ -1223,9 +1212,6 @@ func (h *defaultNetworkControllerEventHandler) SyncFunc(objs []interface{}) erro
 		switch h.objType {
 		case factory.PodType:
 			syncFunc = h.oc.syncPods
-
-		case factory.PolicyType:
-			syncFunc = h.oc.syncNetworkPolicies
 
 		case factory.EgressIPPodType:
 			syncFunc = h.oc.eIPC.syncEgressIPs

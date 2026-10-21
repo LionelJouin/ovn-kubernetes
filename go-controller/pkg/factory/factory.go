@@ -1820,10 +1820,28 @@ func (wf *WatchFactory) GetNetworkPolicy(namespace, name string) (*knet.NetworkP
 	return networkPolicyLister.NetworkPolicies(namespace).Get(name)
 }
 
+// GetNetworkPolicies returns all NetworkPolicy objects from the informer cache
+func (wf *WatchFactory) GetNetworkPolicies() ([]*knet.NetworkPolicy, error) {
+	if wf.informers[PolicyType] == nil {
+		return nil, nil
+	}
+	networkPolicyLister := wf.informers[PolicyType].lister.(netlisters.NetworkPolicyLister)
+	return networkPolicyLister.List(labels.Everything())
+}
+
 // GetMultinetworkPolicy gets a specific multinetwork policy by the namespace/name
 func (wf *WatchFactory) GetMultiNetworkPolicy(namespace, name string) (*mnpapi.MultiNetworkPolicy, error) {
 	multinetworkPolicyLister := wf.informers[MultiNetworkPolicyType].lister.(mnplister.MultiNetworkPolicyLister)
 	return multinetworkPolicyLister.MultiNetworkPolicies(namespace).Get(name)
+}
+
+// GetMultiNetworkPolicies returns all MultiNetworkPolicy objects from the informer cache
+func (wf *WatchFactory) GetMultiNetworkPolicies() ([]*mnpapi.MultiNetworkPolicy, error) {
+	if wf.informers[MultiNetworkPolicyType] == nil {
+		return nil, nil
+	}
+	multinetworkPolicyLister := wf.informers[MultiNetworkPolicyType].lister.(mnplister.MultiNetworkPolicyLister)
+	return multinetworkPolicyLister.List(labels.Everything())
 }
 
 func (wf *WatchFactory) GetEgressFirewall(namespace, name string) (*egressfirewallapi.EgressFirewall, error) {
@@ -1908,6 +1926,20 @@ func (wf *WatchFactory) EgressServiceInformer() egressserviceinformer.EgressServ
 
 func (wf *WatchFactory) APBRouteInformer() adminpolicybasedrouteinformer.AdminPolicyBasedExternalRouteInformer {
 	return wf.apbRouteFactory.K8s().V1().AdminPolicyBasedExternalRoutes()
+}
+
+func (wf *WatchFactory) NetworkPolicyInformer() cache.SharedIndexInformer {
+	if wf.informers[PolicyType] == nil {
+		return nil
+	}
+	return wf.informers[PolicyType].inf
+}
+
+func (wf *WatchFactory) MultiNetworkPolicyInformer() cache.SharedIndexInformer {
+	if wf.informers[MultiNetworkPolicyType] == nil {
+		return nil
+	}
+	return wf.informers[MultiNetworkPolicyType].inf
 }
 
 func (wf *WatchFactory) ANPInformer() anpinformer.AdminNetworkPolicyInformer {
