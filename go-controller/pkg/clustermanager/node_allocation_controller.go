@@ -7,19 +7,22 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"reflect"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	cache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/id"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	ipgenerator "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/generator/ip"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
-	objretry "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
 
@@ -33,13 +36,11 @@ type nodeAllocationController struct {
 	kube         kube.Interface
 	watchFactory *factory.WatchFactory
 	stopChan     chan struct{}
+	stopOnce     sync.Once
 	wg           *sync.WaitGroup
 
-	// node events factory handler
-	nodeHandler *factory.Handler
-
-	// retry framework for nodes
-	retryNodes *objretry.RetryFramework
+	nodeQueue   workqueue.TypedRateLimitingInterface[string]
+	nodeHandler cache.ResourceEventHandlerRegistration
 
 	// ID allocator for the nodes
 	nodeIDAllocator id.Allocator
@@ -91,44 +92,168 @@ func newNodeAllocationController(ovnClient *util.OVNClusterManagerClientset, wf 
 		transitSwitchIPv6Generator: transitSwitchIPv6Generator,
 	}
 
-	nac.initRetryFramework()
+	if err := nac.initHandlers(); err != nil {
+		return nil, err
+	}
 	return nac, nil
 }
 
-func (nac *nodeAllocationController) initRetryFramework() {
-	// We are interested in only nodes
-	resourceHandler := &objretry.ResourceHandler{
-		HasUpdateFunc:          true,
-		NeedsUpdateDuringRetry: false,
-		ObjType:                factory.NodeType,
-		EventHandler: &nodeAllocationControllerEventHandler{
-			objType:  factory.NodeType,
-			nac:      nac,
-			syncFunc: nil,
-		},
+func (nac *nodeAllocationController) initHandlers() error {
+	nac.nodeQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "node-allocation"},
+	)
+
+	var err error
+	nac.nodeHandler, err = nac.watchFactory.NodeInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    nac.onNodeAdd,
+			UpdateFunc: nac.onNodeUpdate,
+			DeleteFunc: nac.onNodeDelete,
+		}),
+	)
+	if err != nil {
+		nac.Stop()
+		return fmt.Errorf("unable to add node event handler: %w", err)
+	}
+	return nil
+}
+
+func (nac *nodeAllocationController) onNodeAdd(obj interface{}) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return
+	}
+	nac.nodeQueue.Add(node.Name)
+}
+
+func (nac *nodeAllocationController) onNodeUpdate(oldObj, newObj interface{}) {
+	oldNode, ok1 := oldObj.(*corev1.Node)
+	newNode, ok2 := newObj.(*corev1.Node)
+	if !ok1 || !ok2 {
+		return
+	}
+	if !util.NodeIDAnnotationChanged(oldNode, newNode) &&
+		!util.NodeTransitSwitchPortAddrAnnotationChanged(oldNode, newNode) &&
+		util.NoHostSubnet(oldNode) == util.NoHostSubnet(newNode) &&
+		!nac.nodeNeedsUpdate(newNode) {
+		return
+	}
+	nac.nodeQueue.Add(newNode.Name)
+}
+
+func (nac *nodeAllocationController) onNodeDelete(obj interface{}) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		node, ok = tombstone.Obj.(*corev1.Node)
+		if !ok {
+			return
+		}
+	}
+	nac.nodeQueue.Add(node.Name)
+}
+
+func (nac *nodeAllocationController) runNodeWorker(_ context.Context) {
+	for nac.processNodeItem() {
+	}
+}
+
+func (nac *nodeAllocationController) processNodeItem() bool {
+	nodeName, shutdown := nac.nodeQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer nac.nodeQueue.Done(nodeName)
+
+	err := nac.reconcileNode(nodeName)
+	if err != nil {
+		if nac.nodeQueue.NumRequeues(nodeName) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling node %s: %v, requeuing", nodeName, err)
+			nac.nodeQueue.AddRateLimited(nodeName)
+			return true
+		}
+		klog.Errorf("Dropping node %s out of queue after %d attempts: %v", nodeName, controller.DefaultMaxAttempts, err)
+	}
+	nac.nodeQueue.Forget(nodeName)
+	return true
+}
+
+func (nac *nodeAllocationController) nodeNeedsUpdate(node *corev1.Node) bool {
+	if needsNodeAllocation(node) {
+		return true
+	}
+	nodeID, _ := util.GetNodeID(node)
+	return nodeID != nac.nodeIDAllocator.GetID(node.Name)
+}
+
+func (nac *nodeAllocationController) reconcileNode(nodeName string) error {
+	node, err := nac.watchFactory.GetNode(nodeName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nac.handleDeleteNode(nodeName)
+		}
+		return fmt.Errorf("failed to get node %s from informer: %w", nodeName, err)
 	}
 
-	nac.retryNodes = objretry.NewRetryFramework("nodeAllocationController", nac.stopChan, nac.wg, nac.watchFactory, resourceHandler)
+	if !nac.nodeNeedsUpdate(node) {
+		return nil
+	}
+	return nac.handleAddUpdateNodeEvent(node)
+}
+
+func (nac *nodeAllocationController) WatchNodes(ctx context.Context, workers int) error {
+	if nac.nodeQueue == nil {
+		return fmt.Errorf("nodeQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		nac.wg.Add(1)
+		go func() {
+			defer nac.wg.Done()
+			wait.UntilWithContext(ctx, nac.runNodeWorker, time.Second)
+		}()
+	}
+
+	return nil
 }
 
 // Start starts the node allocation controller to watch the kubernetes nodes
 func (nac *nodeAllocationController) Start(_ context.Context) error {
-	nodeHandler, err := nac.retryNodes.WatchResource()
-
+	nodes, err := nac.watchFactory.GetNodes()
 	if err != nil {
-		return fmt.Errorf("unable to watch nodes: %w", err)
+		return fmt.Errorf("unable to list nodes: %w", err)
+	}
+	nodeObjs := make([]interface{}, len(nodes))
+	for i, n := range nodes {
+		nodeObjs[i] = n
+	}
+	if err := nac.syncNodes(nodeObjs); err != nil {
+		return fmt.Errorf("unable to sync nodes: %w", err)
 	}
 
-	nac.nodeHandler = nodeHandler
+	runCtx := wait.ContextForChannel(nac.stopChan)
+	if err := nac.WatchNodes(runCtx, 1); err != nil {
+		return fmt.Errorf("unable to watch nodes: %w", err)
+	}
 	return nil
 }
 
 func (nac *nodeAllocationController) Stop() {
-	close(nac.stopChan)
+	nac.stopOnce.Do(func() {
+		close(nac.stopChan)
+	})
+	if nac.nodeQueue != nil {
+		nac.nodeQueue.ShutDown()
+	}
 	nac.wg.Wait()
 
 	if nac.nodeHandler != nil {
-		nac.watchFactory.RemoveNodeHandler(nac.nodeHandler)
+		_ = nac.watchFactory.NodeInformer().RemoveEventHandler(nac.nodeHandler)
+		nac.nodeHandler = nil
 	}
 }
 
@@ -188,8 +313,8 @@ func (nac *nodeAllocationController) handleAddUpdateNodeEvent(node *corev1.Node)
 }
 
 // handleDeleteNode handles the delete node event.
-func (nac *nodeAllocationController) handleDeleteNode(node *corev1.Node) error {
-	nac.nodeIDAllocator.ReleaseID(node.Name)
+func (nac *nodeAllocationController) handleDeleteNode(nodeName string) error {
+	nac.nodeIDAllocator.ReleaseID(nodeName)
 	return nil
 }
 
@@ -227,164 +352,4 @@ func (nac *nodeAllocationController) syncNodeIDs(nodes []interface{}) error {
 	}
 
 	return nil
-}
-
-// nodeAllocationControllerEventHandler object handles the events
-// from retry framework.
-type nodeAllocationControllerEventHandler struct {
-	objretry.DefaultEventHandler
-
-	objType  reflect.Type
-	nac      *nodeAllocationController
-	syncFunc func([]interface{}) error
-
-	nodeSyncFailed sync.Map
-}
-
-func (h *nodeAllocationControllerEventHandler) FilterOutResource(_ interface{}) bool {
-	return false
-}
-
-// nodeAllocationControllerEventHandler functions
-
-// AddResource adds the specified object to the cluster according to its type and
-// returns the error, if any, yielded during object creation.
-func (h *nodeAllocationControllerEventHandler) AddResource(obj interface{}, _ bool) error {
-	var err error
-
-	switch h.objType {
-	case factory.NodeType:
-		node, ok := obj.(*corev1.Node)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *corev1.Node", obj)
-		}
-		if err = h.nac.handleAddUpdateNodeEvent(node); err != nil {
-			h.nodeSyncFailed.Store(node.Name, true)
-			return fmt.Errorf("node add failed for %s, will try again later: %w",
-				node.Name, err)
-		}
-		h.nodeSyncFailed.Delete(node.Name)
-	default:
-		return fmt.Errorf("no add function for object type %s", h.objType)
-	}
-	return nil
-}
-
-// UpdateResource updates the specified object in the cluster to its version in newObj according
-// to its type and returns the error, if any, yielded during the object update.
-// The inRetryCache boolean argument is to indicate if the given resource is in the retryCache or not.
-func (h *nodeAllocationControllerEventHandler) UpdateResource(_, newObj interface{}, _ bool) error {
-	var err error
-
-	switch h.objType {
-	case factory.NodeType:
-		node, ok := newObj.(*corev1.Node)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *corev1.Node", newObj)
-		}
-		_, nodeFailed := h.nodeSyncFailed.Load(node.GetName())
-		if !nodeFailed && !needsNodeAllocation(node) {
-			// node ID and transit switch IP are assigned by us and cannot change
-			return nil
-		}
-		if err = h.nac.handleAddUpdateNodeEvent(node); err != nil {
-			return fmt.Errorf("node update failed for %s, will try again later: %w",
-				node.Name, err)
-		}
-		h.nodeSyncFailed.Delete(node.GetName())
-	default:
-		return fmt.Errorf("no update function for object type %s", h.objType)
-	}
-	return nil
-}
-
-// DeleteResource deletes the object from the cluster according to the delete logic of its resource type.
-// cachedObj is the internal cache entry for this object, used for now for pods and network policies.
-func (h *nodeAllocationControllerEventHandler) DeleteResource(obj, _ interface{}) error {
-	switch h.objType {
-	case factory.NodeType:
-		node, ok := obj.(*corev1.Node)
-		if !ok {
-			return fmt.Errorf("could not cast obj of type %T to *knet.Node", obj)
-		}
-		err := h.nac.handleDeleteNode(node)
-		if err != nil {
-			return err
-		}
-		h.nodeSyncFailed.Delete(node.GetName())
-	}
-	return nil
-}
-
-func (h *nodeAllocationControllerEventHandler) SyncFunc(objs []interface{}) error {
-	var syncFunc func([]interface{}) error
-
-	if h.syncFunc != nil {
-		// syncFunc was provided explicitly
-		syncFunc = h.syncFunc
-	} else {
-		switch h.objType {
-		case factory.NodeType:
-			syncFunc = h.nac.syncNodes
-
-		default:
-			return fmt.Errorf("no sync function for object type %s", h.objType)
-		}
-	}
-	if syncFunc == nil {
-		return nil
-	}
-	return syncFunc(objs)
-}
-
-func (h *nodeAllocationControllerEventHandler) AreResourcesEqual(obj1, obj2 interface{}) (bool, error) {
-	// switch based on type
-	if h.objType == factory.NodeType {
-		node1, ok := obj1.(*corev1.Node)
-		if !ok {
-			return false, fmt.Errorf("could not cast obj1 of type %T to *corev1.Node", obj1)
-		}
-		node2, ok := obj2.(*corev1.Node)
-		if !ok {
-			return false, fmt.Errorf("could not cast obj2 of type %T to *corev1.Node", obj2)
-		}
-
-		// Check if the annotations have changed.
-		if util.NodeIDAnnotationChanged(node1, node2) {
-			return false, nil
-		}
-		if util.NodeTransitSwitchPortAddrAnnotationChanged(node1, node2) {
-			return false, nil
-		}
-		// Check if a node is switched between ho node to ovn node
-		if util.NoHostSubnet(node1) != util.NoHostSubnet(node2) {
-			return false, nil
-		}
-		return true, nil
-	}
-
-	return false, nil
-}
-
-// GetResourceFromInformerCache returns the latest state of the object from the informers cache
-// given an object key and its type
-func (h *nodeAllocationControllerEventHandler) GetResourceFromInformerCache(key string) (interface{}, error) {
-	var obj interface{}
-	var name string
-	var err error
-
-	_, name, err = cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to split key %s: %w", key, err)
-	}
-
-	switch h.objType {
-	case factory.NodeType:
-		obj, err = h.nac.watchFactory.GetNode(name)
-
-	default:
-		err = fmt.Errorf("object type %s not supported, cannot retrieve it from informers cache",
-			h.objType)
-	}
-	return obj, err
 }

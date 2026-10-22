@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"reflect"
 	"sync"
 	"time"
 
@@ -17,11 +16,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	cache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/workqueue"
 	k8snodeutil "k8s.io/component-helpers/node/util"
 	"k8s.io/klog/v2"
 
@@ -32,13 +34,13 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/clustermanager/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/clustermanager/pod"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	sharednode "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controllers/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/networkmanager"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/persistentips"
-	objretry "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
@@ -56,17 +58,18 @@ type networkClusterController struct {
 	// allocator; normal reads go through the informer/lister.
 	nodeClient kubernetes.Interface
 	stopChan   chan struct{}
+	stopOnce   sync.Once
 	wg         *sync.WaitGroup
 
 	nodeReconciler *sharednode.NodeController
 
-	// retry framework for L2 pod ip allocation
-	podHandler *factory.Handler
-	retryPods  *objretry.RetryFramework
+	podQueue            workqueue.TypedRateLimitingInterface[string]
+	podHandler          cache.ResourceEventHandlerRegistration
+	pendingPodDeletions sync.Map // map[string]*corev1.Pod
 
-	// retry framework for persistent ip allocation
-	ipamClaimHandler *factory.Handler
-	retryIPAMClaims  *objretry.RetryFramework
+	ipamClaimQueue        workqueue.TypedRateLimitingInterface[string]
+	ipamClaimHandler      cache.ResourceEventHandlerRegistration
+	pendingClaimDeletions sync.Map // map[string]*ipamclaimsapi.IPAMClaim
 	// tunnelIDAllocator of tunnelIDs within the network
 	tunnelIDAllocator   id.Allocator
 	podAllocator        *pod.PodAllocator
@@ -447,7 +450,6 @@ func (ncc *networkClusterController) init() error {
 	}
 
 	if ncc.hasPodAllocation() {
-		ncc.retryPods = ncc.newRetryFramework(factory.PodType, true)
 		ipAllocator, err := newIPAllocatorForNetwork(ncc.GetNetInfo())
 		if err != nil {
 			return fmt.Errorf("could not initialize the IP allocator for network %q: %w", ncc.GetNetworkName(), err)
@@ -461,7 +463,6 @@ func (ncc *networkClusterController) init() error {
 
 		persistentIPsEnabled := ncc.allowPersistentIPs()
 		if persistentIPsEnabled {
-			ncc.retryIPAMClaims = ncc.newRetryFramework(factory.IPAMClaimsType, true)
 			ncc.ipamClaimReconciler = persistentips.NewIPAMClaimReconciler(
 				ncc.kube,
 				ncc.GetNetInfo(),
@@ -497,6 +498,10 @@ func (ncc *networkClusterController) init() error {
 		)
 		if err := ncc.podAllocator.Init(); err != nil {
 			return fmt.Errorf("failed to initialize pod ip allocator: %w", err)
+		}
+
+		if err := ncc.initHandlers(); err != nil {
+			return err
 		}
 	}
 
@@ -746,39 +751,366 @@ func (ncc *networkClusterController) Start(_ context.Context) error {
 	}
 
 	if ncc.hasPodAllocation() {
+		runCtx := wait.ContextForChannel(ncc.stopChan)
 		if ncc.allowPersistentIPs() {
 			start = time.Now()
 			klog.Infof("Cluster manager network controller %q starting IPAMClaim watcher...", ncc.GetNetworkName())
 			// we need to start listening to IPAMClaim events before pod events, to
 			// ensure we don't start processing pod allocations before having the
 			// existing IPAMClaim allocations reserved in the in-memory IP pool.
-			ipamClaimHandler, err := ncc.retryIPAMClaims.WatchResource()
+			claims, err := ncc.watchFactory.IPAMClaimsInformer().Lister().List(labels.Everything())
 			if err != nil {
+				return fmt.Errorf("failed to get IPAMClaims for initial sync: %w", err)
+			}
+			claimObjs := make([]interface{}, len(claims))
+			for i, c := range claims {
+				claimObjs[i] = c
+			}
+			if err := ncc.ipamClaimReconciler.Sync(claimObjs, ncc.subnetAllocator); err != nil {
+				return fmt.Errorf("failed to sync IPAMClaims: %w", err)
+			}
+
+			if err := ncc.WatchIPAMClaims(runCtx, 1); err != nil {
 				return fmt.Errorf("unable to watch IPAMClaims: %w", err)
 			}
-			ncc.ipamClaimHandler = ipamClaimHandler
 			klog.Infof("Cluster manager network controller %q completed watch IPAMClaims. Took: %v", ncc.GetNetworkName(), time.Since(start))
 		}
 
 		start = time.Now()
 		klog.Infof("Cluster manager network controller %q starting Pod watcher...", ncc.GetNetworkName())
-		podHandler, err := ncc.retryPods.WatchResource()
+		pods, err := ncc.watchFactory.GetAllPods()
 		if err != nil {
+			return fmt.Errorf("failed to get pods for initial sync: %w", err)
+		}
+		podObjs := make([]interface{}, len(pods))
+		for i, p := range pods {
+			podObjs[i] = p
+		}
+		if err := ncc.podAllocator.Sync(podObjs); err != nil {
+			return fmt.Errorf("failed to sync pods: %w", err)
+		}
+
+		if err := ncc.WatchPods(runCtx, 1); err != nil {
 			return fmt.Errorf("unable to watch pods: %w", err)
 		}
-		ncc.podHandler = podHandler
 		klog.Infof("Cluster manager network controller %q completed watch Pods. Took: %v", ncc.GetNetworkName(), time.Since(start))
 	}
 
 	return nil
 }
 
+func (ncc *networkClusterController) initHandlers() error {
+	if ncc.podQueue != nil {
+		return nil
+	}
+	ncc.podQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: ncc.GetNetworkName() + "-pods"},
+	)
+	var err error
+	ncc.podHandler, err = ncc.watchFactory.PodInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    ncc.onPodAdd,
+			UpdateFunc: ncc.onPodUpdate,
+			DeleteFunc: ncc.onPodDelete,
+		}),
+	)
+	if err != nil {
+		ncc.Stop()
+		return fmt.Errorf("unable to add pod event handler for network %s: %w", ncc.GetNetworkName(), err)
+	}
+
+	if ncc.allowPersistentIPs() {
+		ncc.ipamClaimQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+			controller.DefaultRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: ncc.GetNetworkName() + "-ipamclaims"},
+		)
+		ncc.ipamClaimHandler, err = ncc.watchFactory.IPAMClaimsInformer().Informer().AddEventHandler(
+			factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+				AddFunc:    ncc.onIPAMClaimAdd,
+				UpdateFunc: ncc.onIPAMClaimUpdate,
+				DeleteFunc: ncc.onIPAMClaimDelete,
+			}),
+		)
+		if err != nil {
+			ncc.Stop()
+			return fmt.Errorf("unable to add IPAMClaim event handler for network %s: %w", ncc.GetNetworkName(), err)
+		}
+	}
+	return nil
+}
+
+func (ncc *networkClusterController) WatchPods(ctx context.Context, workers int) error {
+	if ncc.podQueue == nil {
+		return fmt.Errorf("podQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		ncc.wg.Add(1)
+		go func() {
+			defer ncc.wg.Done()
+			wait.UntilWithContext(ctx, ncc.runPodWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (ncc *networkClusterController) runPodWorker(_ context.Context) {
+	for ncc.processPodItem() {
+	}
+}
+
+func (ncc *networkClusterController) processPodItem() bool {
+	key, shutdown := ncc.podQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer ncc.podQueue.Done(key)
+
+	err := ncc.reconcilePod(key)
+	if err != nil {
+		if ncc.podQueue.NumRequeues(key) < controller.DefaultMaxAttempts {
+			klog.Warningf("Error reconciling pod %s for network %s: %v, requeuing", key, ncc.GetNetworkName(), err)
+			ncc.podQueue.AddRateLimited(key)
+			return true
+		}
+		klog.Errorf("Dropping pod %s for network %s out of queue after %d attempts: %v", key, ncc.GetNetworkName(), controller.DefaultMaxAttempts, err)
+		if namespace, name, splitErr := cache.SplitMetaNamespaceKey(key); splitErr == nil {
+			if _, getErr := ncc.watchFactory.GetPod(namespace, name); apierrors.IsNotFound(getErr) {
+				ncc.pendingPodDeletions.Delete(key)
+			}
+		}
+	}
+	ncc.podQueue.Forget(key)
+	return true
+}
+
+func (ncc *networkClusterController) reconcilePod(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	curPod, err := ncc.watchFactory.GetPod(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if val, exists := ncc.pendingPodDeletions.Load(key); exists {
+				deletedPod := val.(*corev1.Pod)
+				if err := ncc.podAllocator.Reconcile(deletedPod, nil); err != nil {
+					return fmt.Errorf("failed to release pod %s on delete: %w", key, err)
+				}
+				ncc.pendingPodDeletions.Delete(key)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get pod %s: %w", key, err)
+	}
+
+	if val, exists := ncc.pendingPodDeletions.Load(key); exists {
+		deletedPod := val.(*corev1.Pod)
+		if deletedPod.UID != curPod.UID {
+			if err := ncc.podAllocator.Reconcile(deletedPod, nil); err != nil {
+				return fmt.Errorf("failed to release replaced pod %s on delete: %w", key, err)
+			}
+			ncc.pendingPodDeletions.Delete(key)
+		}
+	}
+
+	return ncc.podAllocator.Reconcile(nil, curPod)
+}
+
+func (ncc *networkClusterController) onPodAdd(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		return
+	}
+	ncc.podQueue.Add(key)
+}
+
+func (ncc *networkClusterController) onPodUpdate(_, newObj interface{}) {
+	newPod, ok := newObj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(newPod)
+	if err != nil {
+		return
+	}
+	ncc.podQueue.Add(key)
+}
+
+func (ncc *networkClusterController) onPodDelete(obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		pod, ok = tombstone.Obj.(*corev1.Pod)
+		if !ok {
+			return
+		}
+	}
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		return
+	}
+	ncc.pendingPodDeletions.Store(key, pod)
+	ncc.podQueue.Add(key)
+}
+
+func (ncc *networkClusterController) WatchIPAMClaims(ctx context.Context, workers int) error {
+	if ncc.ipamClaimQueue == nil {
+		return fmt.Errorf("ipamClaimQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		ncc.wg.Add(1)
+		go func() {
+			defer ncc.wg.Done()
+			wait.UntilWithContext(ctx, ncc.runIPAMClaimWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (ncc *networkClusterController) runIPAMClaimWorker(_ context.Context) {
+	for ncc.processIPAMClaimItem() {
+	}
+}
+
+func (ncc *networkClusterController) processIPAMClaimItem() bool {
+	key, shutdown := ncc.ipamClaimQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer ncc.ipamClaimQueue.Done(key)
+
+	err := ncc.reconcileIPAMClaim(key)
+	if err != nil {
+		if ncc.ipamClaimQueue.NumRequeues(key) < controller.DefaultMaxAttempts {
+			klog.Warningf("Error reconciling IPAMClaim %s for network %s: %v, requeuing", key, ncc.GetNetworkName(), err)
+			ncc.ipamClaimQueue.AddRateLimited(key)
+			return true
+		}
+		klog.Errorf("Dropping IPAMClaim %s for network %s out of queue after %d attempts: %v", key, ncc.GetNetworkName(), controller.DefaultMaxAttempts, err)
+		if namespace, name, splitErr := cache.SplitMetaNamespaceKey(key); splitErr == nil {
+			if _, getErr := ncc.watchFactory.GetIPAMClaim(namespace, name); apierrors.IsNotFound(getErr) {
+				ncc.pendingClaimDeletions.Delete(key)
+			}
+		}
+	}
+	ncc.ipamClaimQueue.Forget(key)
+	return true
+}
+
+func (ncc *networkClusterController) reconcileIPAMClaim(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("failed to split key %s: %w", key, err)
+	}
+
+	curClaim, err := ncc.watchFactory.GetIPAMClaim(namespace, name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if val, exists := ncc.pendingClaimDeletions.Load(key); exists {
+				deletedClaim := val.(*ipamclaimsapi.IPAMClaim)
+				err := ncc.ipamClaimReconciler.Reconcile(deletedClaim, nil, ncc.subnetAllocator)
+				if err != nil && !errors.Is(err, persistentips.ErrIgnoredIPAMClaim) {
+					return fmt.Errorf("failed to release IPAMClaim %s on delete: %w", key, err)
+				}
+				if err == nil {
+					klog.Infof("Released IPs %q for network %q", deletedClaim.Status.IPs, deletedClaim.Spec.Network)
+				}
+				ncc.pendingClaimDeletions.Delete(key)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get IPAMClaim %s: %w", key, err)
+	}
+
+	if val, exists := ncc.pendingClaimDeletions.Load(key); exists {
+		deletedClaim := val.(*ipamclaimsapi.IPAMClaim)
+		if deletedClaim.UID != curClaim.UID {
+			err := ncc.ipamClaimReconciler.Reconcile(deletedClaim, nil, ncc.subnetAllocator)
+			if err != nil && !errors.Is(err, persistentips.ErrIgnoredIPAMClaim) {
+				return fmt.Errorf("failed to release replaced IPAMClaim %s on delete: %w", key, err)
+			}
+			if err == nil {
+				klog.Infof("Released IPs %q for replaced IPAMClaim %s on network %q", deletedClaim.Status.IPs, key, deletedClaim.Spec.Network)
+			}
+			ncc.pendingClaimDeletions.Delete(key)
+		}
+	}
+
+	return nil
+}
+
+func (ncc *networkClusterController) onIPAMClaimAdd(obj interface{}) {
+	claim, ok := obj.(*ipamclaimsapi.IPAMClaim)
+	if !ok {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(claim)
+	if err != nil {
+		return
+	}
+	ncc.ipamClaimQueue.Add(key)
+}
+
+func (ncc *networkClusterController) onIPAMClaimUpdate(_, newObj interface{}) {
+	claim, ok := newObj.(*ipamclaimsapi.IPAMClaim)
+	if !ok {
+		return
+	}
+	key, err := cache.MetaNamespaceKeyFunc(claim)
+	if err != nil {
+		return
+	}
+	ncc.ipamClaimQueue.Add(key)
+}
+
+func (ncc *networkClusterController) onIPAMClaimDelete(obj interface{}) {
+	claim, ok := obj.(*ipamclaimsapi.IPAMClaim)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		claim, ok = tombstone.Obj.(*ipamclaimsapi.IPAMClaim)
+		if !ok {
+			return
+		}
+	}
+	key, err := cache.MetaNamespaceKeyFunc(claim)
+	if err != nil {
+		return
+	}
+	ncc.pendingClaimDeletions.Store(key, claim)
+	ncc.ipamClaimQueue.Add(key)
+}
+
 func (ncc *networkClusterController) Stop() {
-	close(ncc.stopChan)
+	ncc.stopOnce.Do(func() {
+		close(ncc.stopChan)
+	})
+	if ncc.podQueue != nil {
+		ncc.podQueue.ShutDown()
+	}
+	if ncc.ipamClaimQueue != nil {
+		ncc.ipamClaimQueue.ShutDown()
+	}
 	ncc.wg.Wait()
 
 	if ncc.ipamClaimHandler != nil {
-		ncc.watchFactory.RemoveIPAMClaimsHandler(ncc.ipamClaimHandler)
+		_ = ncc.watchFactory.IPAMClaimsInformer().Informer().RemoveEventHandler(ncc.ipamClaimHandler)
+		ncc.ipamClaimHandler = nil
 	}
 
 	if ncc.hasNodeAllocation() && ncc.nodeReconciler != nil {
@@ -786,22 +1118,9 @@ func (ncc *networkClusterController) Stop() {
 	}
 
 	if ncc.podHandler != nil {
-		ncc.watchFactory.RemovePodHandler(ncc.podHandler)
+		_ = ncc.watchFactory.PodInformer().RemoveEventHandler(ncc.podHandler)
+		ncc.podHandler = nil
 	}
-}
-
-func (ncc *networkClusterController) newRetryFramework(objectType reflect.Type, hasUpdateFunc bool) *objretry.RetryFramework {
-	resourceHandler := &objretry.ResourceHandler{
-		HasUpdateFunc:          hasUpdateFunc,
-		NeedsUpdateDuringRetry: false,
-		ObjType:                objectType,
-		EventHandler: &networkClusterControllerEventHandler{
-			objType:  objectType,
-			ncc:      ncc,
-			syncFunc: nil,
-		},
-	}
-	return objretry.NewRetryFramework(ncc.GetNetworkName()+"/clustermanager", ncc.stopChan, ncc.wg, ncc.watchFactory, resourceHandler)
 }
 
 // Cleanup the subnet annotations from the node for the User Defined Networks
@@ -874,9 +1193,20 @@ func (ncc *networkClusterController) Reconcile(netInfo util.NetInfo) error {
 	if err != nil {
 		klog.Errorf("Failed to reconcile network %s: %v", ncc.GetNetworkName(), err)
 	}
-	if reconcilePendingPods && ncc.retryPods != nil {
-		if err := objretry.RequeuePendingPods(ncc.watchFactory, ncc.GetNetInfo(), ncc.retryPods); err != nil {
-			klog.Errorf("Failed to requeue pending pods for network %s: %v", ncc.GetNetworkName(), err)
+	if reconcilePendingPods && ncc.podQueue != nil {
+		allPods, err := ncc.watchFactory.GetAllPods()
+		if err != nil {
+			klog.Errorf("Failed to list pods for network %s: %v", ncc.GetNetworkName(), err)
+		} else {
+			for _, pod := range allPods {
+				if util.PodScheduled(pod) && pod.Status.Phase == corev1.PodPending {
+					key, err := cache.MetaNamespaceKeyFunc(pod)
+					if err == nil {
+						klog.V(5).Infof("Adding pending pod %s to podQueue for network %s", key, ncc.GetNetworkName())
+						ncc.podQueue.Add(key)
+					}
+				}
+			}
 		}
 	}
 	return nil
@@ -890,155 +1220,6 @@ func (ncc *networkClusterController) updateNADKeysChanged(nadKeys []string) bool
 	changed := ncc.lastNADKeys == nil || !next.Equal(ncc.lastNADKeys)
 	ncc.lastNADKeys = next
 	return changed
-}
-
-// networkClusterControllerEventHandler object handles the events
-// from retry framework.
-type networkClusterControllerEventHandler struct {
-	objretry.DefaultEventHandler
-
-	objType  reflect.Type
-	ncc      *networkClusterController
-	syncFunc func([]interface{}) error
-}
-
-func (h *networkClusterControllerEventHandler) FilterOutResource(_ interface{}) bool {
-	return false
-}
-
-// networkClusterControllerEventHandler functions
-
-// AddResource adds the specified object to the cluster according to its type and
-// returns the error, if any, yielded during object creation.
-func (h *networkClusterControllerEventHandler) AddResource(obj interface{}, _ bool) error {
-	switch h.objType {
-	case factory.PodType:
-		pod, ok := obj.(*corev1.Pod)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *corev1.Pod", obj)
-		}
-		err := h.ncc.podAllocator.Reconcile(nil, pod)
-		if err != nil {
-			return err
-		}
-	case factory.IPAMClaimsType:
-		return nil
-	default:
-		return fmt.Errorf("no add function for object type %s", h.objType)
-	}
-	return nil
-}
-
-// UpdateResource updates the specified object in the cluster to its version in newObj according
-// to its type and returns the error, if any, yielded during the object update.
-// The inRetryCache boolean argument is to indicate if the given resource is in the retryCache or not.
-func (h *networkClusterControllerEventHandler) UpdateResource(oldObj, newObj interface{}, _ bool) error {
-	switch h.objType {
-	case factory.PodType:
-		old, ok := oldObj.(*corev1.Pod)
-		if !ok {
-			return fmt.Errorf("could not cast %T old object to *corev1.Pod", oldObj)
-		}
-		new, ok := newObj.(*corev1.Pod)
-		if !ok {
-			return fmt.Errorf("could not cast %T new object to *corev1.Pod", newObj)
-		}
-		err := h.ncc.podAllocator.Reconcile(old, new)
-		if err != nil {
-			return err
-		}
-	case factory.IPAMClaimsType:
-		return nil
-	default:
-		return fmt.Errorf("no update function for object type %s", h.objType)
-	}
-	return nil
-}
-
-// DeleteResource deletes the object from the cluster according to the delete logic of its resource type.
-// cachedObj is the internal cache entry for this object, used for now for pods and network policies.
-func (h *networkClusterControllerEventHandler) DeleteResource(obj, _ interface{}) error {
-	switch h.objType {
-	case factory.PodType:
-		pod, ok := obj.(*corev1.Pod)
-		if !ok {
-			return fmt.Errorf("could not cast %T object to *corev1.Pod", obj)
-		}
-		err := h.ncc.podAllocator.Reconcile(pod, nil)
-		if err != nil {
-			return err
-		}
-	case factory.IPAMClaimsType:
-		ipamClaim, ok := obj.(*ipamclaimsapi.IPAMClaim)
-		if !ok {
-			return fmt.Errorf("could not cast obj of type %T to *ipamclaimsapi.IPAMClaim", obj)
-		}
-
-		err := h.ncc.ipamClaimReconciler.Reconcile(ipamClaim, nil, h.ncc.subnetAllocator)
-		if err != nil && !errors.Is(err, persistentips.ErrIgnoredIPAMClaim) {
-			return fmt.Errorf("error deleting IPAMClaim: %w", err)
-		} else if errors.Is(err, persistentips.ErrIgnoredIPAMClaim) {
-			return nil // let's avoid the log below, since nothing was released.
-		}
-		klog.Infof("Released IPs %q for network %q", ipamClaim.Status.IPs, ipamClaim.Spec.Network)
-	}
-	return nil
-}
-
-func (h *networkClusterControllerEventHandler) SyncFunc(objs []interface{}) error {
-	var syncFunc func([]interface{}) error
-
-	if h.syncFunc != nil {
-		// syncFunc was provided explicitly
-		syncFunc = h.syncFunc
-	} else {
-		switch h.objType {
-		case factory.PodType:
-			syncFunc = h.ncc.podAllocator.Sync
-		case factory.IPAMClaimsType:
-			syncFunc = func(claims []interface{}) error {
-				return h.ncc.ipamClaimReconciler.Sync(
-					claims,
-					h.ncc.subnetAllocator,
-				)
-			}
-
-		default:
-			return fmt.Errorf("no sync function for object type %s", h.objType)
-		}
-	}
-	if syncFunc == nil {
-		return nil
-	}
-	return syncFunc(objs)
-}
-
-func (h *networkClusterControllerEventHandler) AreResourcesEqual(_, _ interface{}) (bool, error) {
-	return false, nil
-}
-
-// GetResourceFromInformerCache returns the latest state of the object from the informers cache
-// given an object key and its type
-func (h *networkClusterControllerEventHandler) GetResourceFromInformerCache(key string) (interface{}, error) {
-	var obj interface{}
-	var namespace, name string
-	var err error
-
-	namespace, name, err = cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to split key %s: %v", key, err)
-	}
-
-	switch h.objType {
-	case factory.PodType:
-		obj, err = h.ncc.watchFactory.GetPod(namespace, name)
-	case factory.IPAMClaimsType:
-		obj, err = h.ncc.watchFactory.GetIPAMClaim(namespace, name)
-	default:
-		err = fmt.Errorf("object type %s not supported, cannot retrieve it from informers cache",
-			h.objType)
-	}
-	return obj, err
 }
 
 // OVN uses an overlay and doesn't need GCE Routes, we need to

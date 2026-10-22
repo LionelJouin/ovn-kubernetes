@@ -11,12 +11,17 @@ import (
 	"time"
 
 	cnitypes "github.com/containernetworking/cni/pkg/types"
+	ipamclaimsapi "github.com/k8snetworkplumbingwg/ipamclaims/pkg/crd/ipamclaims/v1alpha1"
+	fakeipamclaimclient "github.com/k8snetworkplumbingwg/ipamclaims/pkg/crd/ipamclaims/v1alpha1/apis/clientset/versioned/fake"
 	"github.com/onsi/gomega"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
 	ovncnitypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
@@ -24,6 +29,7 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/networkmanager"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/persistentips"
 	ovntest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
@@ -520,4 +526,288 @@ func labelValue(labels []*dto.LabelPair, name string) string {
 		}
 	}
 	return ""
+}
+
+func TestNetworkClusterControllerInitHandlersIdempotent(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	err := config.PrepareTestConfig()
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+	config.OVNKubernetesFeature.EnableMultiNetwork = true
+
+	netConf := &ovncnitypes.NetConf{
+		NetConf: cnitypes.NetConf{
+			Name: "ns1_udn1_idempotent_test",
+			Type: "ovn-k8s-cni-overlay",
+		},
+		Topology: types.Layer2Topology,
+		Role:     types.NetworkRolePrimary,
+		Subnets:  "10.50.0.0/16",
+	}
+	netInfo, err := util.NewNetInfo(netConf)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	fakeClient := util.GetOVNClientset().GetClusterManagerClientset()
+	wf, err := factory.NewClusterManagerWatchFactory(fakeClient)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(wf.Start()).To(gomega.Succeed())
+	defer wf.Shutdown()
+
+	nm := &networkmanager.FakeNetworkManager{}
+	nodeController := nodecontroller.NewController(wf, "clustermanager-node", nm)
+	g.Expect(nodeController.Start()).To(gomega.Succeed())
+	defer nodeController.Stop()
+
+	ncc := newNetworkClusterController(
+		netInfo,
+		fakeClient,
+		wf,
+		nil,
+		nm,
+		nil,
+		nodeController,
+	)
+	g.Expect(ncc.init()).To(gomega.Succeed())
+	firstQueue := ncc.podQueue
+	firstHandler := ncc.podHandler
+	g.Expect(firstQueue).ToNot(gomega.BeNil())
+	g.Expect(firstHandler).ToNot(gomega.BeNil())
+
+	// Call initHandlers again to verify it is idempotent
+	g.Expect(ncc.initHandlers()).To(gomega.Succeed())
+	g.Expect(ncc.podQueue).To(gomega.Equal(firstQueue))
+	g.Expect(ncc.podHandler).To(gomega.Equal(firstHandler))
+}
+
+func TestNetworkClusterControllerPodWorkqueueReconciliation(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	err := config.PrepareTestConfig()
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+	config.OVNKubernetesFeature.EnableMultiNetwork = true
+
+	netConf := &ovncnitypes.NetConf{
+		NetConf: cnitypes.NetConf{
+			Name: "ns1_udn1_pod_wq_test",
+			Type: "ovn-k8s-cni-overlay",
+		},
+		Topology: types.Layer2Topology,
+		Role:     types.NetworkRolePrimary,
+		Subnets:  "10.60.0.0/24",
+	}
+	netInfo, err := util.NewNetInfo(netConf)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	networkName := netInfo.GetNetworkName()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			UID:       k8stypes.UID("uid-1"),
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node1",
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node1",
+		},
+	}
+
+	fakeClient := util.GetOVNClientset(node, pod).GetClusterManagerClientset()
+	wf, err := factory.NewClusterManagerWatchFactory(fakeClient)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(wf.Start()).To(gomega.Succeed())
+	defer wf.Shutdown()
+
+	fakeRecorder := record.NewFakeRecorder(10)
+	nm := &networkmanager.FakeNetworkManager{
+		PrimaryNetworks: map[string]util.NetInfo{"default": netInfo},
+		NADNetworks:     map[string]util.NetInfo{"default/nad": netInfo},
+	}
+	nodeController := nodecontroller.NewController(wf, "clustermanager-node", nm)
+	g.Expect(nodeController.Start()).To(gomega.Succeed())
+	defer nodeController.Stop()
+
+	ncc := newNetworkClusterController(
+		netInfo,
+		fakeClient,
+		wf,
+		fakeRecorder,
+		nm,
+		nil,
+		nodeController,
+	)
+	g.Expect(ncc.init()).To(gomega.Succeed())
+	g.Expect(ncc.Start(context.Background())).To(gomega.Succeed())
+	defer ncc.Stop()
+
+	// 1. Verify pod is allocated asynchronously by the worker
+	g.Eventually(func() bool {
+		updatedPod, err := fakeClient.KubeClient.CoreV1().Pods("default").Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		podAnnotation, err := util.UnmarshalPodAnnotation(updatedPod.Annotations, "default/nad")
+		return err == nil && len(podAnnotation.IPs) > 0
+	}, 3*time.Second).Should(gomega.BeTrue())
+
+	allocatedPod, err := fakeClient.KubeClient.CoreV1().Pods("default").Get(context.TODO(), pod.Name, metav1.GetOptions{})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	_, err = util.UnmarshalPodAnnotation(allocatedPod.Annotations, "default/nad")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	// 2. Test pod recreation with same name and new UID
+	podV2 := pod.DeepCopy()
+	podV2.UID = k8stypes.UID("uid-2")
+	podV2.Annotations = nil
+	_, err = fakeClient.KubeClient.CoreV1().Pods("default").Update(context.TODO(), podV2, metav1.UpdateOptions{})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	g.Eventually(func() string {
+		updatedPod, err := fakeClient.KubeClient.CoreV1().Pods("default").Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		if err != nil {
+			return ""
+		}
+		podAnnotation, err := util.UnmarshalPodAnnotation(updatedPod.Annotations, "default/nad")
+		if err != nil || len(podAnnotation.IPs) == 0 {
+			return ""
+		}
+		return podAnnotation.IPs[0].IP.String()
+	}, 3*time.Second).ShouldNot(gomega.BeEmpty())
+
+	// 3. Test pod delete via tombstone (DeletedFinalStateUnknown)
+	latestPod, err := fakeClient.KubeClient.CoreV1().Pods("default").Get(context.TODO(), pod.Name, metav1.GetOptions{})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	latestAnnot, err := util.UnmarshalPodAnnotation(latestPod.Annotations, "default/nad")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	err = fakeClient.KubeClient.CoreV1().Pods("default").Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	tombstone := cache.DeletedFinalStateUnknown{
+		Key: "default/" + pod.Name,
+		Obj: latestPod,
+	}
+	ncc.onPodDelete(tombstone)
+
+	// Verify the previously allocated IP can now be allocated again to another owner
+	g.Eventually(func() error {
+		return ncc.subnetAllocator.AllocateIPs(networkName, "new-owner", latestAnnot.IPs)
+	}, 3*time.Second).Should(gomega.Succeed())
+}
+
+func TestNetworkClusterControllerIPAMClaimWorkqueueReconciliation(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	err := config.PrepareTestConfig()
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+	config.OVNKubernetesFeature.EnableMultiNetwork = true
+	config.OVNKubernetesFeature.EnablePersistentIPs = true
+
+	netConf := &ovncnitypes.NetConf{
+		NetConf: cnitypes.NetConf{
+			Name: "ns1_udn1_claim_wq_test",
+			Type: "ovn-k8s-cni-overlay",
+		},
+		Topology:           types.Layer2Topology,
+		Role:               types.NetworkRolePrimary,
+		Subnets:            "10.70.0.0/24",
+		AllowPersistentIPs: true,
+	}
+	netInfo, err := util.NewNetInfo(netConf)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	networkName := netInfo.GetNetworkName()
+
+	claimName := "test-claim"
+	namespace := "default"
+	allocatedIP := "10.70.0.5/24"
+	claim := &ipamclaimsapi.IPAMClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      claimName,
+			Namespace: namespace,
+			UID:       k8stypes.UID("claim-uid-1"),
+		},
+		Spec: ipamclaimsapi.IPAMClaimSpec{
+			Network: networkName,
+		},
+		Status: ipamclaimsapi.IPAMClaimStatus{
+			IPs: []string{allocatedIP},
+		},
+	}
+
+	fakeClient := util.GetOVNClientset().GetClusterManagerClientset()
+	fakeClient.IPAMClaimsClient = fakeipamclaimclient.NewSimpleClientset(claim)
+	wf, err := factory.NewClusterManagerWatchFactory(fakeClient)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(wf.Start()).To(gomega.Succeed())
+	defer wf.Shutdown()
+
+	fakeRecorder := record.NewFakeRecorder(10)
+	nm := &networkmanager.FakeNetworkManager{
+		PrimaryNetworks: map[string]util.NetInfo{"default": netInfo},
+		NADNetworks:     map[string]util.NetInfo{"default/nad": netInfo},
+	}
+	nodeController := nodecontroller.NewController(wf, "clustermanager-node", nm)
+	g.Expect(nodeController.Start()).To(gomega.Succeed())
+	defer nodeController.Stop()
+
+	ncc := newNetworkClusterController(
+		netInfo,
+		fakeClient,
+		wf,
+		fakeRecorder,
+		nm,
+		nil,
+		nodeController,
+	)
+	g.Expect(ncc.init()).To(gomega.Succeed())
+	g.Expect(ncc.Start(context.Background())).To(gomega.Succeed())
+	defer ncc.Stop()
+
+	key := namespace + "/" + claimName
+
+	// 1. Verify that the allocated IP is reserved in the allocator
+	parsedIPs, err := util.ParseIPNets([]string{allocatedIP})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(ncc.subnetAllocator.AllocateIPs(networkName, "other-owner", parsedIPs)).ToNot(gomega.Succeed())
+
+	// 2. Test IPAMClaim replacement with same name and new UID
+	claimV2 := claim.DeepCopy()
+	claimV2.UID = k8stypes.UID("claim-uid-2")
+	claimV2.Status.IPs = []string{"10.70.0.6/24"}
+	_, err = fakeClient.IPAMClaimsClient.K8sV1alpha1().IPAMClaims(namespace).Update(context.TODO(), claimV2, metav1.UpdateOptions{})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	// The replaced claim's IP (10.70.0.5/24) must be released.
+	g.Eventually(func() error {
+		return ncc.subnetAllocator.AllocateIPs(networkName, "replacement-check", parsedIPs)
+	}, 3*time.Second).Should(gomega.Succeed())
+	g.Expect(ncc.subnetAllocator.ReleaseIPs(networkName, "replacement-check", parsedIPs)).To(gomega.Succeed())
+
+	// Reserve the new claim's IP so the delete path has something to release.
+	parsedIP2, err := util.ParseIPNets([]string{"10.70.0.6/24"})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	g.Expect(ncc.subnetAllocator.AllocateIPs(networkName, persistentips.IPAMClaimOwner(claimV2), parsedIP2)).To(gomega.Succeed())
+
+	// 3. Test IPAMClaim delete via tombstone (DeletedFinalStateUnknown)
+	latestClaim, err := fakeClient.IPAMClaimsClient.K8sV1alpha1().IPAMClaims(namespace).Get(context.TODO(), claimName, metav1.GetOptions{})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	err = fakeClient.IPAMClaimsClient.K8sV1alpha1().IPAMClaims(namespace).Delete(context.TODO(), claimName, metav1.DeleteOptions{})
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	tombstone := cache.DeletedFinalStateUnknown{
+		Key: key,
+		Obj: latestClaim,
+	}
+	ncc.onIPAMClaimDelete(tombstone)
+
+	// Verify the released IP can now be allocated again
+	g.Eventually(func() error {
+		return ncc.subnetAllocator.AllocateIPs(networkName, "new-claim-owner", parsedIP2)
+	}, 3*time.Second).Should(gomega.Succeed())
 }
