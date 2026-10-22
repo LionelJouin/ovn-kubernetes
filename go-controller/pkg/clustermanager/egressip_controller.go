@@ -24,19 +24,22 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	cache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/allocator/id"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/controller"
 	egressipv1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/egressip/v1"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/metrics"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/healthcheck"
-	objretry "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/retry"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 	utilerrors "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util/errors"
@@ -105,11 +108,15 @@ var hccAllocator healthcheckClientAllocator = &egressIPHealthcheckClientAllocato
 // egressNode is a cache helper used for egress IP assignment, representing an egress node
 type egressNode struct {
 	egressIPConfig     *util.ParsedNodeEgressIPConfiguration
+	committedConfig    *util.ParsedNodeEgressIPConfiguration
+	hostCIDRs          string
+	committedCIDRs     string
 	mgmtIPs            []net.IP
 	allocations        map[string]string
 	healthClient       healthcheck.EgressIPHealthClient
 	isReady            bool
 	isReachable        bool
+	hasEgressLabel     bool
 	isEgressAssignable bool
 	name               string
 }
@@ -355,6 +362,7 @@ func (eIPC *egressIPClusterController) executeCloudPrivateIPConfigChange(egressI
 type egressIPClusterController struct {
 	recorder record.EventRecorder
 	stopChan chan struct{}
+	stopOnce sync.Once
 	wg       *sync.WaitGroup
 	kube     *kube.KubeOVN
 	// egressIPAssignmentMutex is used to ensure a safe updates between
@@ -388,21 +396,18 @@ type egressIPClusterController struct {
 	reachabilityCheckInterval time.Duration
 	// EgressIP Node reachability gRPC port (0 means it should use dial instead)
 	egressIPNodeHealthCheckPort int
-	// retry framework for Egress nodes
-	retryEgressNodes *objretry.RetryFramework
-	// retry framework for egress IP
-	retryEgressIPs *objretry.RetryFramework
-	// retry framework for Cloud private IP config
-	retryCloudPrivateIPConfig *objretry.RetryFramework
-	// egressNodes events factory handler
-	egressNodeHandler *factory.Handler
-	// egressIP events factory handler
-	egressIPHandler *factory.Handler
-	// cloudPrivateIPConfig events factory handler
-	cloudPrivateIPConfigHandler *factory.Handler
+
+	egressNodeQueue   workqueue.TypedRateLimitingInterface[string]
+	egressNodeHandler cache.ResourceEventHandlerRegistration
+
+	egressIPQueue   workqueue.TypedRateLimitingInterface[string]
+	egressIPHandler cache.ResourceEventHandlerRegistration
+
+	cloudPrivateIPConfigQueue   workqueue.TypedRateLimitingInterface[string]
+	cloudPrivateIPConfigHandler cache.ResourceEventHandlerRegistration
 }
 
-func newEgressIPController(ovnClient *util.OVNClusterManagerClientset, wf *factory.WatchFactory, recorder record.EventRecorder) *egressIPClusterController {
+func newEgressIPController(ovnClient *util.OVNClusterManagerClientset, wf *factory.WatchFactory, recorder record.EventRecorder) (*egressIPClusterController, error) {
 	kube := &kube.KubeOVN{
 		Kube:               kube.Kube{KClient: ovnClient.KubeClient},
 		EIPClient:          ovnClient.EgressIPClient,
@@ -426,48 +431,80 @@ func newEgressIPController(ovnClient *util.OVNClusterManagerClientset, wf *facto
 		egressIPNodeHealthCheckPort:       config.OVNKubernetesFeature.EgressIPNodeHealthCheckPort,
 		stopChan:                          make(chan struct{}),
 	}
-	eIPC.initRetryFramework()
-	return eIPC
+	if err := eIPC.initHandlers(); err != nil {
+		return nil, err
+	}
+	return eIPC, nil
 }
 
-func (eIPC *egressIPClusterController) initRetryFramework() {
-	eIPC.retryEgressNodes = eIPC.newRetryFramework(factory.EgressNodeType)
-	eIPC.retryEgressIPs = eIPC.newRetryFramework(factory.EgressIPType)
+func (eIPC *egressIPClusterController) initHandlers() error {
+	eIPC.egressNodeQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "cm-egress-nodes"},
+	)
+	var err error
+	eIPC.egressNodeHandler, err = eIPC.watchFactory.NodeInformer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    eIPC.onEgressNodeAdd,
+			UpdateFunc: eIPC.onEgressNodeUpdate,
+			DeleteFunc: eIPC.onEgressNodeDelete,
+		}),
+	)
+	if err != nil {
+		eIPC.Stop()
+		return fmt.Errorf("unable to add egress node handler: %w", err)
+	}
+
+	eIPC.egressIPQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controller.DefaultRateLimiter[string](),
+		workqueue.TypedRateLimitingQueueConfig[string]{Name: "cm-egress-ips"},
+	)
+	eIPC.egressIPHandler, err = eIPC.watchFactory.EgressIPInformer().Informer().AddEventHandler(
+		factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+			AddFunc:    eIPC.onEgressIPAdd,
+			UpdateFunc: eIPC.onEgressIPUpdate,
+			DeleteFunc: eIPC.onEgressIPDelete,
+		}),
+	)
+	if err != nil {
+		eIPC.Stop()
+		return fmt.Errorf("unable to add egress IP handler: %w", err)
+	}
+
 	if util.PlatformTypeIsEgressIPCloudProvider() {
-		eIPC.retryCloudPrivateIPConfig = eIPC.newRetryFramework(factory.CloudPrivateIPConfigType)
+		eIPC.cloudPrivateIPConfigQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+			controller.DefaultRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "cm-cloud-private-ip-configs"},
+		)
+		eIPC.cloudPrivateIPConfigHandler, err = eIPC.watchFactory.CloudPrivateIPConfigInformer().Informer().AddEventHandler(
+			factory.WithUpdateHandlingForObjReplace(cache.ResourceEventHandlerFuncs{
+				AddFunc:    eIPC.onCloudPrivateIPConfigAdd,
+				UpdateFunc: eIPC.onCloudPrivateIPConfigUpdate,
+				DeleteFunc: eIPC.onCloudPrivateIPConfigDelete,
+			}),
+		)
+		if err != nil {
+			eIPC.Stop()
+			return fmt.Errorf("unable to add cloud private IP config handler: %w", err)
+		}
 	}
-}
-
-func (eIPC *egressIPClusterController) newRetryFramework(objectType reflect.Type) *objretry.RetryFramework {
-	eventHandler := &egressIPClusterControllerEventHandler{
-		objType:  objectType,
-		eIPC:     eIPC,
-		syncFunc: nil,
-	}
-	resourceHandler := &objretry.ResourceHandler{
-		HasUpdateFunc:          true, // all egressIP types have update func
-		NeedsUpdateDuringRetry: true, // true for all egressIP types
-		ObjType:                objectType,
-		EventHandler:           eventHandler,
-	}
-	return objretry.NewRetryFramework("EgressIPClusterController", eIPC.stopChan, eIPC.wg, eIPC.watchFactory, resourceHandler)
+	return nil
 }
 
 func (eIPC *egressIPClusterController) Start() error {
-	var err error
-	// In cluster manager, we only need to watch for egressNodes, egressIPs
-	// and cloudPrivateIPConfig
-	if eIPC.egressNodeHandler, err = eIPC.WatchEgressNodes(); err != nil {
-		return fmt.Errorf("unable to watch egress nodes %w", err)
+	if err := eIPC.WatchEgressNodes(); err != nil {
+		return fmt.Errorf("unable to watch egress nodes: %w", err)
 	}
-	if eIPC.egressIPHandler, err = eIPC.WatchEgressIP(); err != nil {
-		return err
+	if err := eIPC.WatchEgressIP(); err != nil {
+		return fmt.Errorf("unable to watch egress IPs: %w", err)
 	}
+
 	if util.PlatformTypeIsEgressIPCloudProvider() {
-		if eIPC.cloudPrivateIPConfigHandler, err = eIPC.WatchCloudPrivateIPConfig(); err != nil {
-			return err
+		if err := eIPC.WatchCloudPrivateIPConfig(); err != nil {
+			return fmt.Errorf("unable to watch cloud private IP configs: %w", err)
 		}
 	}
+
 	if config.OVNKubernetesFeature.EgressIPReachabiltyTotalTimeout == 0 {
 		klog.V(2).Infof("EgressIP node reachability check disabled")
 	} else if config.OVNKubernetesFeature.EgressIPNodeHealthCheckPort != 0 {
@@ -479,34 +516,511 @@ func (eIPC *egressIPClusterController) Start() error {
 
 // WatchEgressNodes starts the watching of egress assignable nodes and calls
 // back the appropriate handler logic.
-func (eIPC *egressIPClusterController) WatchEgressNodes() (*factory.Handler, error) {
-	return eIPC.retryEgressNodes.WatchResource()
+func (eIPC *egressIPClusterController) WatchEgressNodes() error {
+	runCtx := wait.ContextForChannel(eIPC.stopChan)
+	if !cache.WaitForNamedCacheSync("egress-nodes", runCtx.Done(), eIPC.egressNodeHandler.HasSynced) {
+		return fmt.Errorf("timed out waiting for egress node caches to sync")
+	}
+	nodes, err := eIPC.watchFactory.GetNodes()
+	if err != nil {
+		return fmt.Errorf("unable to list nodes for initial sync: %w", err)
+	}
+	if err := eIPC.initEgressNodeReachability(nodes); err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		if err := eIPC.reconcileEgressNode(n.Name); err != nil {
+			klog.Warningf("Initial reconcile of egress node %s failed, requeuing: %v", n.Name, err)
+			eIPC.egressNodeQueue.AddRateLimited(n.Name)
+		}
+	}
+	if err := eIPC.WatchEgressNodesWithWorkers(runCtx, 1); err != nil {
+		return err
+	}
+	return nil
+}
+
+// WatchEgressIP starts the watching of egressip resource and calls back the
+// appropriate handler logic.
+func (eIPC *egressIPClusterController) WatchEgressIP() error {
+	runCtx := wait.ContextForChannel(eIPC.stopChan)
+	if !cache.WaitForNamedCacheSync("egress-ips", runCtx.Done(), eIPC.egressIPHandler.HasSynced) {
+		return fmt.Errorf("timed out waiting for egress IP caches to sync")
+	}
+	eips, err := eIPC.watchFactory.GetEgressIPs()
+	if err != nil {
+		return fmt.Errorf("unable to list egress IPs for initial sync: %w", err)
+	}
+	if err := eIPC.syncEgressIPMarkAllocator(eips); err != nil {
+		return err
+	}
+	if err := eIPC.WatchEgressIPWithWorkers(runCtx, 1); err != nil {
+		return err
+	}
+	return nil
 }
 
 // WatchCloudPrivateIPConfig starts the watching of cloudprivateipconfigs
 // resource and calls back the appropriate handler logic.
-func (eIPC *egressIPClusterController) WatchCloudPrivateIPConfig() (*factory.Handler, error) {
-	return eIPC.retryCloudPrivateIPConfig.WatchResource()
+func (eIPC *egressIPClusterController) WatchCloudPrivateIPConfig() error {
+	runCtx := wait.ContextForChannel(eIPC.stopChan)
+	if !cache.WaitForNamedCacheSync("cloud-private-ip-configs", runCtx.Done(), eIPC.cloudPrivateIPConfigHandler.HasSynced) {
+		return fmt.Errorf("timed out waiting for cloud private IP config caches to sync")
+	}
+	configs, err := eIPC.watchFactory.GetCloudPrivateIPConfigs()
+	if err != nil {
+		return fmt.Errorf("unable to list cloud private IP configs for initial sync: %w", err)
+	}
+	if err := eIPC.syncCloudPrivateIPConfigs(configs); err != nil {
+		return err
+	}
+	if err := eIPC.WatchCloudPrivateIPConfigWithWorkers(runCtx, 1); err != nil {
+		return err
+	}
+	return nil
 }
 
-// WatchEgressIP starts the watching of egressip resource and calls back the
-// appropriate handler logic. It also initiates the other dedicated resource
-// handlers for egress IP setup: namespaces, pods.
-func (eIPC *egressIPClusterController) WatchEgressIP() (*factory.Handler, error) {
-	return eIPC.retryEgressIPs.WatchResource()
+func (eIPC *egressIPClusterController) WatchEgressNodesWithWorkers(ctx context.Context, workers int) error {
+	if eIPC.egressNodeQueue == nil {
+		return fmt.Errorf("egressNodeQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		eIPC.wg.Add(1)
+		go func() {
+			defer eIPC.wg.Done()
+			wait.UntilWithContext(ctx, eIPC.runEgressNodeWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (eIPC *egressIPClusterController) runEgressNodeWorker(_ context.Context) {
+	for eIPC.processEgressNodeItem() {
+	}
+}
+
+func (eIPC *egressIPClusterController) processEgressNodeItem() bool {
+	nodeName, shutdown := eIPC.egressNodeQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer eIPC.egressNodeQueue.Done(nodeName)
+
+	err := eIPC.reconcileEgressNode(nodeName)
+	if err != nil {
+		if eIPC.egressNodeQueue.NumRequeues(nodeName) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling egress node %s: %v, requeuing", nodeName, err)
+			eIPC.egressNodeQueue.AddRateLimited(nodeName)
+			return true
+		}
+		klog.Errorf("Dropping egress node %s out of queue after %d attempts: %v", nodeName, controller.DefaultMaxAttempts, err)
+	}
+	eIPC.egressNodeQueue.Forget(nodeName)
+	return true
+}
+
+func (eIPC *egressIPClusterController) reconcileEgressNode(nodeName string) (err error) {
+	curNode, err := eIPC.watchFactory.GetNode(nodeName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			var wasEgressNode bool
+			eIPC.nodeAllocator.Lock()
+			if eNode, exists := eIPC.nodeAllocator.cache[nodeName]; exists {
+				wasEgressNode = eNode.hasEgressLabel || len(eNode.allocations) > 0
+			}
+			eIPC.nodeAllocator.Unlock()
+
+			eIPC.deleteNodeForEgress(nodeName)
+			if wasEgressNode {
+				if err := eIPC.deleteEgressNode(nodeName); err != nil {
+					return fmt.Errorf("failed to delete egress node assignments for %s: %w", nodeName, err)
+				}
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+
+	// EgressIP is not supported on hybrid overlay nodes
+	if util.NoHostSubnet(curNode) {
+		return nil
+	}
+
+	if initErr := eIPC.initEgressIPAllocator(curNode); initErr != nil {
+		klog.Warningf("Egress node initialization error: %v", initErr)
+	}
+	defer func() {
+		if err == nil {
+			eIPC.commitEgressNodeConfig(curNode)
+		}
+	}()
+
+	nodeEgressLabel := util.GetNodeEgressLabel()
+	newLabels := curNode.GetLabels()
+	_, newHasEgressLabel := newLabels[nodeEgressLabel]
+
+	parsedEgressIPConfig, configErr := util.GetNodeEIPConfig(curNode)
+	newHostCIDRs := curNode.Annotations[util.OVNNodeHostCIDRs]
+
+	var oldHadEgressLabel, oldNodeIsAssignable, isOldReady bool
+	var hadAllocations bool
+	var isCloudEgressIPConfigAltered, isHostCIDRsAltered bool
+	eIPC.nodeAllocator.Lock()
+	if eNode, exists := eIPC.nodeAllocator.cache[curNode.Name]; exists {
+		oldHadEgressLabel = eNode.hasEgressLabel
+		oldNodeIsAssignable = eNode.isEgressAssignable
+		isOldReady = eNode.isReady
+		hadAllocations = len(eNode.allocations) > 0
+		if configErr == nil {
+			isCloudEgressIPConfigAltered = !reflect.DeepEqual(eNode.committedConfig, parsedEgressIPConfig)
+		}
+		isHostCIDRsAltered = eNode.committedCIDRs != newHostCIDRs
+	} else {
+		isCloudEgressIPConfigAltered = configErr == nil
+		isHostCIDRsAltered = true
+	}
+	eIPC.nodeAllocator.Unlock()
+
+	// If the node is not labeled for egress assignment and never was, return directly
+	if !oldHadEgressLabel && !newHasEgressLabel {
+		return nil
+	}
+
+	// A node is only assignable when it carries the egress-assignable label
+	// and its host-cidrs annotation is present, parseable, and non-empty.
+	nodeIsAssignable := newHasEgressLabel
+	if nodeIsAssignable {
+		hostCIDRs, parseErr := util.ParseNodeHostCIDRsDropNetMask(curNode)
+		nodeIsAssignable = parseErr == nil && hostCIDRs.Len() > 0
+		if parseErr != nil {
+			klog.Warningf("Node %s is not egress-assignable: failed to parse host-cidrs: %v", curNode.Name, parseErr)
+		} else if hostCIDRs.Len() == 0 {
+			klog.Warningf("Node %s is not egress-assignable: host-cidrs contains no host CIDRs", curNode.Name)
+		}
+	}
+
+	isNewReady := eIPC.isEgressNodeReady(curNode)
+	isNewReachable := eIPC.isEgressNodeReachable(curNode)
+
+	// If the node has the egress label but is no longer assignable (host-cidrs annotation missing or invalid)
+	if newHasEgressLabel && !nodeIsAssignable && (oldNodeIsAssignable || hadAllocations) {
+		klog.Infof("Node: %s is no longer assignable (host-cidrs annotation missing or invalid), "+
+			"deleting it from egress assignment", curNode.Name)
+		eIPC.setNodeEgressLabelAndAssignable(curNode.Name, newHasEgressLabel, false)
+		eIPC.setNodeEgressReady(curNode.Name, isNewReady)
+		if err := eIPC.deleteEgressNode(curNode.Name); err != nil {
+			if oldNodeIsAssignable {
+				eIPC.setNodeEgressLabelAndAssignable(curNode.Name, newHasEgressLabel, true)
+			}
+			return fmt.Errorf("failed to delete egress assignments for node %s: %w", curNode.Name, err)
+		}
+		return nil
+	}
+
+	// If the node was un-labeled
+	if (oldHadEgressLabel || hadAllocations) && !newHasEgressLabel {
+		klog.Infof("Node: %s has been un-labeled, deleting it from egress assignment", curNode.Name)
+		eIPC.setNodeEgressLabelAndAssignable(curNode.Name, false, false)
+		if err := eIPC.deleteEgressNode(curNode.Name); err != nil {
+			if oldHadEgressLabel {
+				eIPC.setNodeEgressLabelAndAssignable(curNode.Name, true, oldNodeIsAssignable)
+			}
+			return fmt.Errorf("failed to delete egress assignments for node %s: %w", curNode.Name, err)
+		}
+		return nil
+	}
+
+	eIPC.setNodeEgressLabelAndAssignable(curNode.Name, newHasEgressLabel, nodeIsAssignable)
+	eIPC.setNodeEgressReady(curNode.Name, isNewReady)
+
+	// If the node was newly labeled
+	if !oldHadEgressLabel && newHasEgressLabel {
+		klog.Infof("Node: %s has been labeled, adding it for egress assignment", curNode.Name)
+		if isNewReady && isNewReachable && nodeIsAssignable {
+			eIPC.setNodeEgressReachable(curNode.Name, isNewReachable)
+			if err := eIPC.addEgressNode(curNode.Name); err != nil {
+				return err
+			}
+		} else {
+			klog.Warningf("Node: %s has been labeled, but node is not ready/reachable/assignable, "+
+				"cannot use it for egress assignment", curNode.Name)
+		}
+		return nil
+	}
+
+	if isOldReady == isNewReady && !isHostCIDRsAltered && !isCloudEgressIPConfigAltered {
+		return nil
+	}
+
+	if !isNewReady {
+		klog.Warningf("Node: %s is not ready, deleting it from egress assignment", curNode.Name)
+		if err := eIPC.deleteEgressNode(curNode.Name); err != nil {
+			return err
+		}
+	} else if isNewReady && isNewReachable && nodeIsAssignable {
+		switch {
+		case isCloudEgressIPConfigAltered && isHostCIDRsAltered:
+			klog.Infof("Node: %s cloud egress IP config annotation and host CIDRs changed, re-evaluating egress IP assignments", curNode.Name)
+		case isCloudEgressIPConfigAltered:
+			klog.Infof("Node: %s cloud egress IP config annotation changed, re-evaluating egress IP assignments", curNode.Name)
+		default:
+			klog.Infof("Node: %s is ready and reachable, adding it for egress assignment", curNode.Name)
+		}
+		eIPC.setNodeEgressReachable(curNode.Name, isNewReachable)
+		if err := eIPC.addEgressNode(curNode.Name); err != nil {
+			return err
+		}
+	}
+
+	if isHostCIDRsAltered {
+		if err := eIPC.reconcileSecondaryHostNetworkEIPs(curNode); err != nil {
+			return fmt.Errorf("failed to reconsider egress IPs that are secondary host networks: %v", err)
+		}
+	}
+	return nil
+}
+
+func (eIPC *egressIPClusterController) onEgressNodeAdd(obj interface{}) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return
+	}
+	eIPC.egressNodeQueue.Add(node.Name)
+}
+
+func (eIPC *egressIPClusterController) onEgressNodeUpdate(_, newObj interface{}) {
+	newNode, ok := newObj.(*corev1.Node)
+	if !ok {
+		return
+	}
+	eIPC.egressNodeQueue.Add(newNode.Name)
+}
+
+func (eIPC *egressIPClusterController) onEgressNodeDelete(obj interface{}) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		node, ok = tombstone.Obj.(*corev1.Node)
+		if !ok {
+			_, name, err := cache.SplitMetaNamespaceKey(tombstone.Key)
+			if err != nil {
+				return
+			}
+			eIPC.egressNodeQueue.Add(name)
+			return
+		}
+	}
+	eIPC.egressNodeQueue.Add(node.Name)
+}
+
+func (eIPC *egressIPClusterController) WatchEgressIPWithWorkers(ctx context.Context, workers int) error {
+	if eIPC.egressIPQueue == nil {
+		return fmt.Errorf("egressIPQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		eIPC.wg.Add(1)
+		go func() {
+			defer eIPC.wg.Done()
+			wait.UntilWithContext(ctx, eIPC.runEgressIPWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (eIPC *egressIPClusterController) runEgressIPWorker(_ context.Context) {
+	for eIPC.processEgressIPItem() {
+	}
+}
+
+func (eIPC *egressIPClusterController) processEgressIPItem() bool {
+	name, shutdown := eIPC.egressIPQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer eIPC.egressIPQueue.Done(name)
+
+	err := eIPC.reconcileEgressIPItem(name)
+	if err != nil {
+		if eIPC.egressIPQueue.NumRequeues(name) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling egress IP %s: %v, requeuing", name, err)
+			eIPC.egressIPQueue.AddRateLimited(name)
+			return true
+		}
+		klog.Errorf("Dropping egress IP %s out of queue after %d attempts: %v", name, controller.DefaultMaxAttempts, err)
+	}
+	eIPC.egressIPQueue.Forget(name)
+	return true
+}
+
+func (eIPC *egressIPClusterController) reconcileEgressIPItem(name string) error {
+	curEIP, err := eIPC.watchFactory.GetEgressIP(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return eIPC.reconcileEgressIP(&egressipv1.EgressIP{ObjectMeta: metav1.ObjectMeta{Name: name}}, nil)
+		}
+		return fmt.Errorf("failed to get egress IP %s: %w", name, err)
+	}
+
+	return eIPC.reconcileEgressIP(nil, curEIP)
+}
+
+func (eIPC *egressIPClusterController) onEgressIPAdd(obj interface{}) {
+	eip, ok := obj.(*egressipv1.EgressIP)
+	if !ok {
+		return
+	}
+	eIPC.egressIPQueue.Add(eip.Name)
+}
+
+func (eIPC *egressIPClusterController) onEgressIPUpdate(_, newObj interface{}) {
+	newEIP, ok := newObj.(*egressipv1.EgressIP)
+	if !ok {
+		return
+	}
+	eIPC.egressIPQueue.Add(newEIP.Name)
+}
+
+func (eIPC *egressIPClusterController) onEgressIPDelete(obj interface{}) {
+	eip, ok := obj.(*egressipv1.EgressIP)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		eip, ok = tombstone.Obj.(*egressipv1.EgressIP)
+		if !ok {
+			_, name, err := cache.SplitMetaNamespaceKey(tombstone.Key)
+			if err != nil {
+				return
+			}
+			eIPC.egressIPQueue.Add(name)
+			return
+		}
+	}
+	eIPC.egressIPQueue.Add(eip.Name)
+}
+
+func (eIPC *egressIPClusterController) WatchCloudPrivateIPConfigWithWorkers(ctx context.Context, workers int) error {
+	if eIPC.cloudPrivateIPConfigQueue == nil {
+		return fmt.Errorf("cloudPrivateIPConfigQueue is not initialized")
+	}
+
+	for i := 0; i < workers; i++ {
+		eIPC.wg.Add(1)
+		go func() {
+			defer eIPC.wg.Done()
+			wait.UntilWithContext(ctx, eIPC.runCloudPrivateIPConfigWorker, time.Second)
+		}()
+	}
+
+	return nil
+}
+
+func (eIPC *egressIPClusterController) runCloudPrivateIPConfigWorker(_ context.Context) {
+	for eIPC.processCloudPrivateIPConfigItem() {
+	}
+}
+
+func (eIPC *egressIPClusterController) processCloudPrivateIPConfigItem() bool {
+	name, shutdown := eIPC.cloudPrivateIPConfigQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer eIPC.cloudPrivateIPConfigQueue.Done(name)
+
+	err := eIPC.reconcileCloudPrivateIPConfigItem(name)
+	if err != nil {
+		if eIPC.cloudPrivateIPConfigQueue.NumRequeues(name) < controller.DefaultMaxAttempts {
+			klog.V(4).Infof("Error reconciling cloud private IP config %s: %v, requeuing", name, err)
+			eIPC.cloudPrivateIPConfigQueue.AddRateLimited(name)
+			return true
+		}
+		klog.Errorf("Dropping cloud private IP config %s out of queue after %d attempts: %v", name, controller.DefaultMaxAttempts, err)
+	}
+	eIPC.cloudPrivateIPConfigQueue.Forget(name)
+	return true
+}
+
+func (eIPC *egressIPClusterController) reconcileCloudPrivateIPConfigItem(name string) error {
+	curC, err := eIPC.watchFactory.GetCloudPrivateIPConfig(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return eIPC.reconcileCloudPrivateIPConfig(&ocpcloudnetworkapi.CloudPrivateIPConfig{ObjectMeta: metav1.ObjectMeta{Name: name}}, nil)
+		}
+		return fmt.Errorf("failed to get cloud private IP config %s: %w", name, err)
+	}
+
+	return eIPC.reconcileCloudPrivateIPConfig(nil, curC)
+}
+
+func (eIPC *egressIPClusterController) onCloudPrivateIPConfigAdd(obj interface{}) {
+	c, ok := obj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
+	if !ok {
+		return
+	}
+	eIPC.cloudPrivateIPConfigQueue.Add(c.Name)
+}
+
+func (eIPC *egressIPClusterController) onCloudPrivateIPConfigUpdate(_, newObj interface{}) {
+	newC, ok := newObj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
+	if !ok {
+		return
+	}
+	eIPC.cloudPrivateIPConfigQueue.Add(newC.Name)
+}
+
+func (eIPC *egressIPClusterController) onCloudPrivateIPConfigDelete(obj interface{}) {
+	c, ok := obj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		c, ok = tombstone.Obj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
+		if !ok {
+			_, name, err := cache.SplitMetaNamespaceKey(tombstone.Key)
+			if err != nil {
+				return
+			}
+			eIPC.cloudPrivateIPConfigQueue.Add(name)
+			return
+		}
+	}
+	eIPC.cloudPrivateIPConfigQueue.Add(c.Name)
 }
 
 func (eIPC *egressIPClusterController) Stop() {
-	close(eIPC.stopChan)
+	eIPC.stopOnce.Do(func() {
+		close(eIPC.stopChan)
+	})
+	if eIPC.egressNodeQueue != nil {
+		eIPC.egressNodeQueue.ShutDown()
+	}
+	if eIPC.egressIPQueue != nil {
+		eIPC.egressIPQueue.ShutDown()
+	}
+	if eIPC.cloudPrivateIPConfigQueue != nil {
+		eIPC.cloudPrivateIPConfigQueue.ShutDown()
+	}
 	eIPC.wg.Wait()
 	if eIPC.egressNodeHandler != nil {
-		eIPC.watchFactory.RemoveNodeHandler(eIPC.egressNodeHandler)
+		_ = eIPC.watchFactory.NodeInformer().RemoveEventHandler(eIPC.egressNodeHandler)
+		eIPC.egressNodeHandler = nil
 	}
 	if eIPC.egressIPHandler != nil {
-		eIPC.watchFactory.RemoveEgressIPHandler(eIPC.egressIPHandler)
+		_ = eIPC.watchFactory.EgressIPInformer().Informer().RemoveEventHandler(eIPC.egressIPHandler)
+		eIPC.egressIPHandler = nil
 	}
 	if eIPC.cloudPrivateIPConfigHandler != nil {
-		eIPC.watchFactory.RemoveCloudPrivateIPConfigHandler(eIPC.cloudPrivateIPConfigHandler)
+		_ = eIPC.watchFactory.CloudPrivateIPConfigInformer().Informer().RemoveEventHandler(eIPC.cloudPrivateIPConfigHandler)
+		eIPC.cloudPrivateIPConfigHandler = nil
 	}
 }
 
@@ -534,9 +1048,8 @@ func (eIPC *egressIPClusterController) getSortedEgressData() ([]*egressNode, map
 	return assignableNodes, allAllocations
 }
 
-func (eIPC *egressIPClusterController) initEgressNodeReachability(objs []interface{}) error {
-	for _, obj := range objs {
-		node := obj.(*corev1.Node)
+func (eIPC *egressIPClusterController) initEgressNodeReachability(nodes []*corev1.Node) error {
+	for _, node := range nodes {
 		if err := eIPC.initEgressIPAllocator(node); err != nil {
 			klog.Warningf("Egress node initialization error: %v", err)
 		}
@@ -546,29 +1059,33 @@ func (eIPC *egressIPClusterController) initEgressNodeReachability(objs []interfa
 	// with existing assignments from EgressIP statuses. This prevents duplicate IP
 	// assignments when two EgressIPs have the same IP in their specs but only one has
 	// it assigned in status (e.g., after control-plane restart or during initial sync).
-	egressIPs, err := eIPC.kube.GetEgressIPs()
+	egressIPs, err := eIPC.watchFactory.GetEgressIPs()
 	if err != nil {
 		return fmt.Errorf("unable to list EgressIPs, err: %v", err)
 	}
 	for _, egressIP := range egressIPs {
 		eIPC.ensureAllocatorEgressIPAssignments(egressIP)
+		if util.IsEgressIPMarkSet(egressIP.Annotations) {
+			if mark, err := util.ParseEgressIPMark(egressIP.Annotations); err == nil && mark.IsValid() {
+				_ = eIPC.reserveMark(egressIP.Name, mark.ToInt())
+			}
+		}
 	}
 
-	go eIPC.checkEgressNodesReachability()
+	eIPC.wg.Add(1)
+	go func() {
+		defer eIPC.wg.Done()
+		eIPC.checkEgressNodesReachability()
+	}()
 	return nil
 }
 
-func (eIPC *egressIPClusterController) setNodeEgressAssignable(nodeName string, isAssignable bool) {
+func (eIPC *egressIPClusterController) setNodeEgressLabelAndAssignable(nodeName string, hasLabel, isAssignable bool) {
 	eIPC.nodeAllocator.Lock()
 	defer eIPC.nodeAllocator.Unlock()
 	if eNode, exists := eIPC.nodeAllocator.cache[nodeName]; exists {
+		eNode.hasEgressLabel = hasLabel
 		eNode.isEgressAssignable = isAssignable
-		// if the node is not assignable/ready/reachable anymore we need to
-		// empty all of it's allocations from our cache since we'll clear all
-		// assignments from this node later on, because of this.
-		if !isAssignable {
-			eNode.allocations = make(map[string]string)
-		}
 	}
 }
 
@@ -666,19 +1183,17 @@ func checkEgressNodesReachabilityIterate(eIPC *egressIPClusterController) {
 			klog.Warningf("Node: %s is detected as unreachable, deleting it from egress assignment", nodeName)
 			if err := eIPC.deleteEgressNode(nodeName); err != nil {
 				klog.Errorf("Node: %s is detected as unreachable, but could not re-assign egress IPs, err: %v", nodeName, err)
+				// Reset reachability so the next periodic iteration retries deleting from assignment
+				eIPC.setNodeEgressReachable(nodeName, true)
 			}
 		} else {
 			klog.Infof("Node: %s is detected as reachable and ready again, adding it to egress assignment", nodeName)
-			nodeToAdd, err := eIPC.watchFactory.GetNode(nodeName)
-			if err != nil {
+			eIPC.setNodeEgressReachable(nodeName, true)
+			if err := eIPC.addEgressNode(nodeName); err != nil {
 				klog.Errorf("Node: %s is detected as reachable and ready again, but could not re-assign egress IPs, err: %v", nodeName, err)
+				eIPC.setNodeEgressReachable(nodeName, false)
 				continue
 			}
-			if err := eIPC.retryEgressNodes.AddRetryObjWithAddNoBackoff(nodeToAdd); err != nil {
-				klog.Errorf("Node: %s is detected as reachable and ready again, but could not re-assign egress IPs, err: %v", nodeName, err)
-				continue
-			}
-			eIPC.retryEgressNodes.RequestRetryObjs()
 		}
 	}
 }
@@ -764,6 +1279,7 @@ func (eIPC *egressIPClusterController) reconcileSecondaryHostNetworkEIPs(node *c
 				}
 				if network == "" {
 					reconcileEgressIPs = append(reconcileEgressIPs, egressIP.DeepCopy())
+					break
 				}
 			}
 		}
@@ -816,12 +1332,12 @@ func (eIPC *egressIPClusterController) addEgressNode(nodeName string) error {
 
 // deleteNodeForEgress remove the default allow logical router policies for the
 // node and removes the node from the allocator cache.
-func (eIPC *egressIPClusterController) deleteNodeForEgress(node *corev1.Node) {
+func (eIPC *egressIPClusterController) deleteNodeForEgress(nodeName string) {
 	eIPC.nodeAllocator.Lock()
-	if eNode, exists := eIPC.nodeAllocator.cache[node.Name]; exists {
+	if eNode, exists := eIPC.nodeAllocator.cache[nodeName]; exists {
 		eNode.healthClient.Disconnect()
 	}
-	delete(eIPC.nodeAllocator.cache, node.Name)
+	delete(eIPC.nodeAllocator.cache, nodeName)
 	eIPC.nodeAllocator.Unlock()
 }
 
@@ -859,7 +1375,20 @@ func (eIPC *egressIPClusterController) deleteEgressNode(nodeName string) error {
 	return nil
 }
 
-func (eIPC *egressIPClusterController) initEgressIPAllocator(node *corev1.Node) (err error) {
+func (eIPC *egressIPClusterController) commitEgressNodeConfig(node *corev1.Node) {
+	parsedEgressIPConfig, err := util.GetNodeEIPConfig(node)
+	newHostCIDRs := node.Annotations[util.OVNNodeHostCIDRs]
+	eIPC.nodeAllocator.Lock()
+	defer eIPC.nodeAllocator.Unlock()
+	if eNode, exists := eIPC.nodeAllocator.cache[node.Name]; exists {
+		if err == nil {
+			eNode.committedConfig = parsedEgressIPConfig
+		}
+		eNode.committedCIDRs = newHostCIDRs
+	}
+}
+
+func (eIPC *egressIPClusterController) initEgressIPAllocator(node *corev1.Node) error {
 	parsedEgressIPConfig, err := util.GetNodeEIPConfig(node)
 	if err != nil {
 		return fmt.Errorf("failed to get egress IP config for node %s: %w", node.Name, err)
@@ -872,18 +1401,21 @@ func (eIPC *egressIPClusterController) initEgressIPAllocator(node *corev1.Node) 
 	for i, subnet := range nodeSubnets {
 		mgmtIPs[i] = util.GetNodeManagementIfAddr(subnet).IP
 	}
+	newHostCIDRs := node.Annotations[util.OVNNodeHostCIDRs]
 	eIPC.nodeAllocator.Lock()
 	defer eIPC.nodeAllocator.Unlock()
 	if eNode, exists := eIPC.nodeAllocator.cache[node.Name]; !exists {
 		eIPC.nodeAllocator.cache[node.Name] = &egressNode{
 			name:           node.Name,
 			egressIPConfig: parsedEgressIPConfig,
+			hostCIDRs:      newHostCIDRs,
 			mgmtIPs:        mgmtIPs,
 			allocations:    make(map[string]string),
 			healthClient:   hccAllocator.allocate(node.Name),
 		}
 	} else {
 		eNode.egressIPConfig = parsedEgressIPConfig
+		eNode.hostCIDRs = newHostCIDRs
 		eNode.mgmtIPs = mgmtIPs
 	}
 	return nil
@@ -953,6 +1485,17 @@ func (eIPC *egressIPClusterController) reconcileEgressIP(old, new *egressipv1.Eg
 		name = old.Name
 		status = old.Status.Items
 		staleEgressIPs.Insert(old.Spec.EgressIPs...)
+	} else if new != nil {
+		name = new.Name
+		eIPC.nodeAllocator.Lock()
+		for _, eNode := range eIPC.nodeAllocator.cache {
+			for ip, eipName := range eNode.allocations {
+				if eipName == name {
+					staleEgressIPs.Insert(ip)
+				}
+			}
+		}
+		eIPC.nodeAllocator.Unlock()
 	}
 	if new != nil {
 		newEIP = new
@@ -967,6 +1510,21 @@ func (eIPC *egressIPClusterController) reconcileEgressIP(old, new *egressipv1.Eg
 		}
 	} else {
 		eIPC.deallocMark(name)
+		if len(status) == 0 {
+			eIPC.nodeAllocator.Lock()
+			for nodeName, eNode := range eIPC.nodeAllocator.cache {
+				for ip, eipName := range eNode.allocations {
+					if eipName == name {
+						status = append(status, egressipv1.EgressIPStatusItem{
+							Node:     nodeName,
+							EgressIP: ip,
+						})
+						staleEgressIPs.Insert(ip)
+					}
+				}
+			}
+			eIPC.nodeAllocator.Unlock()
+		}
 	}
 
 	// Validate the spec and use only the valid egress IPs when performing any
@@ -1050,6 +1608,9 @@ func (eIPC *egressIPClusterController) reconcileEgressIP(old, new *egressipv1.Eg
 			// do this we will occupy assignment positions for the ipsToAssign,
 			// even though statusToRemove will be removed afterwards
 			eIPC.deleteAllocatorEgressIPAssignments(statusToRemove)
+		}
+		for staleEgressIP := range staleEgressIPs {
+			eIPC.deleteAllocatorEgressIPAssignmentIfExists(name, staleEgressIP)
 		}
 		if len(ipsToAssign) > 0 {
 			statusToAdd = eIPC.assignEgressIPs(name, ipsToAssign.UnsortedList())
@@ -1144,11 +1705,11 @@ func (eIPC *egressIPClusterController) reconcileEgressIP(old, new *egressipv1.Eg
 // while the cluster manager was down, without the EgressIP status being
 // updated accordingly. This sync ensures the EgressIP status is consistent
 // with the CloudPrivateIPConfig objects currently present.
-func (eIPC *egressIPClusterController) syncCloudPrivateIPConfigs(objs []interface{}) error {
+func (eIPC *egressIPClusterController) syncCloudPrivateIPConfigs(configs []*ocpcloudnetworkapi.CloudPrivateIPConfig) error {
 	if !util.PlatformTypeIsEgressIPCloudProvider() {
 		return nil
 	}
-	cloudPrivateIPConfigMap, err := eIPC.getCloudPrivateIPConfigMap(objs)
+	cloudPrivateIPConfigMap, err := eIPC.getCloudPrivateIPConfigMap(configs)
 	if err != nil {
 		return fmt.Errorf("syncCloudPrivateIPConfigs unable to get cloud private ip config: %w", err)
 	}
@@ -1186,14 +1747,9 @@ func (eIPC *egressIPClusterController) syncCloudPrivateIPConfigs(objs []interfac
 // getCloudPrivateIPConfigMap returns cloud private ip config map cotaining ip address the key and
 // assigned node node name as the value. This method is intended to be invoked only in the case of
 // cloud environment.
-func (eIPC *egressIPClusterController) getCloudPrivateIPConfigMap(objs []interface{}) (map[string]string, error) {
+func (eIPC *egressIPClusterController) getCloudPrivateIPConfigMap(configs []*ocpcloudnetworkapi.CloudPrivateIPConfig) (map[string]string, error) {
 	cloudPrivateIPConfigMap := make(map[string]string)
-	for _, obj := range objs {
-		cloudPrivateIPConfig, ok := obj.(*ocpcloudnetworkapi.CloudPrivateIPConfig)
-		if !ok {
-			klog.Errorf("Could not cast %T object to *ocpcloudnetworkapi.CloudPrivateIPConfig", obj)
-			continue
-		}
+	for _, cloudPrivateIPConfig := range configs {
 		cloudPrivateIPConfigMap[cloudPrivateIPConfig.Name] = cloudPrivateIPConfig.Status.Node
 	}
 	return cloudPrivateIPConfigMap, nil
@@ -1533,6 +2089,12 @@ func (eIPC *egressIPClusterController) reconcileCloudPrivateIPConfig(old, new *o
 	shouldDelete, shouldAdd := false, false
 	nodeToDelete := ""
 
+	newIsAssigned := false
+	if new != nil && len(new.Status.Conditions) > 0 {
+		newIsAssigned = ocpcloudnetworkapi.CloudPrivateIPConfigConditionType(new.Status.Conditions[0].Type) == ocpcloudnetworkapi.Assigned &&
+			corev1.ConditionStatus(new.Status.Conditions[0].Status) == corev1.ConditionTrue
+	}
+
 	if old != nil {
 		oldCloudPrivateIPConfig = old
 		// We need to handle three types of deletes, A) object UPDATE where the
@@ -1545,24 +2107,34 @@ func (eIPC *egressIPClusterController) reconcileCloudPrivateIPConfig(old, new *o
 		shouldDelete = oldCloudPrivateIPConfig.Status.Node != "" || new == nil
 		// On DELETE we need to delete the .spec.node for the old object
 		nodeToDelete = oldCloudPrivateIPConfig.Spec.Node
+	} else if new != nil {
+		// When old is nil, look up any existing allocation for this IP from the node allocator
+		egressIPString := cloudPrivateIPConfigNameToIPString(new.Name)
+		eIPC.nodeAllocator.Lock()
+		for nodeName, eNode := range eIPC.nodeAllocator.cache {
+			if _, exists := eNode.allocations[egressIPString]; exists {
+				nodeToDelete = nodeName
+				shouldDelete = true
+				break
+			}
+		}
+		eIPC.nodeAllocator.Unlock()
 	}
+
 	if new != nil {
 		newCloudPrivateIPConfig = new
 		// We should only proceed to setting things up for objects where the new
 		// object has the same .spec.node and .status.node, and assignment
 		// condition being true. This is how the cloud-network-config-controller
 		// indicates a successful cloud assignment.
-		shouldAdd = newCloudPrivateIPConfig.Status.Node == newCloudPrivateIPConfig.Spec.Node &&
-			ocpcloudnetworkapi.CloudPrivateIPConfigConditionType(newCloudPrivateIPConfig.Status.Conditions[0].Type) == ocpcloudnetworkapi.Assigned &&
-			corev1.ConditionStatus(newCloudPrivateIPConfig.Status.Conditions[0].Status) == corev1.ConditionTrue
+		shouldAdd = newCloudPrivateIPConfig.Status.Node == newCloudPrivateIPConfig.Spec.Node && newIsAssigned
 		// See above explanation for the delete
 		shouldDelete = shouldDelete &&
-			(newCloudPrivateIPConfig.Status.Node == "" || newCloudPrivateIPConfig.Status.Node != oldCloudPrivateIPConfig.Status.Node) &&
-			ocpcloudnetworkapi.CloudPrivateIPConfigConditionType(newCloudPrivateIPConfig.Status.Conditions[0].Type) == ocpcloudnetworkapi.Assigned &&
-			corev1.ConditionStatus(newCloudPrivateIPConfig.Status.Conditions[0].Status) == corev1.ConditionTrue
+			(newCloudPrivateIPConfig.Status.Node == "" || newCloudPrivateIPConfig.Status.Node != nodeToDelete) &&
+			newIsAssigned
 		// On UPDATE we need to delete the old .status.node
-		if shouldDelete {
-			nodeToDelete = oldCloudPrivateIPConfig.Status.Node
+		if shouldDelete && old != nil && old.Status.Node != "" {
+			nodeToDelete = old.Status.Node
 		}
 	}
 
@@ -1570,19 +2142,45 @@ func (eIPC *egressIPClusterController) reconcileCloudPrivateIPConfig(old, new *o
 	// made to the status (since we are the only ones performing the change made
 	// to the spec). So don't process the object if there is no change made to
 	// the status.
-	if reflect.DeepEqual(oldCloudPrivateIPConfig.Status, newCloudPrivateIPConfig.Status) {
+	if old != nil && new != nil && reflect.DeepEqual(old.Status, new.Status) {
+		return nil
+	}
+	if old == nil && new != nil && !shouldDelete && !shouldAdd {
 		return nil
 	}
 
 	if shouldDelete {
 		// Get the EgressIP owner reference
-		egressIPName, exists := oldCloudPrivateIPConfig.Annotations[util.OVNEgressIPOwnerRefLabel]
+		annotations := oldCloudPrivateIPConfig.Annotations
+		cpipcName := oldCloudPrivateIPConfig.Name
+		if len(annotations) == 0 && new != nil {
+			annotations = newCloudPrivateIPConfig.Annotations
+		}
+		if cpipcName == "" && new != nil {
+			cpipcName = newCloudPrivateIPConfig.Name
+		}
+		egressIPName, exists := annotations[util.OVNEgressIPOwnerRefLabel]
+		if !exists {
+			egressIPString := cloudPrivateIPConfigNameToIPString(cpipcName)
+			eIPC.nodeAllocator.Lock()
+			for nodeName, eNode := range eIPC.nodeAllocator.cache {
+				if eip, allocExists := eNode.allocations[egressIPString]; allocExists {
+					egressIPName = eip
+					exists = true
+					if nodeToDelete == "" {
+						nodeToDelete = nodeName
+					}
+					break
+				}
+			}
+			eIPC.nodeAllocator.Unlock()
+		}
 		if !exists {
 			// If a CloudPrivateIPConfig object does not have an egress IP owner reference annotation upon deletion,
-			// there is no way that the object will get one after deletion. Hence, simply log a warning message here
+			// there is no way that the object will get one after deletion. Hence, simply log an info message here
 			// for informative purposes instead of throwing the same error and retrying time and time again.
-			klog.Warningf("CloudPrivateIPConfig object %q was missing the egress IP owner reference annotation "+
-				"upon deletion", oldCloudPrivateIPConfig.Name)
+			klog.V(5).Infof("CloudPrivateIPConfig object %q was missing the egress IP owner reference annotation "+
+				"upon deletion", cpipcName)
 			return nil
 		}
 		// Check if the egress IP has been deleted or not, if we are processing
@@ -1594,7 +2192,7 @@ func (eIPC *egressIPClusterController) reconcileCloudPrivateIPConfig(old, new *o
 		if err != nil && !isDeleted {
 			return err
 		}
-		egressIPString := cloudPrivateIPConfigNameToIPString(oldCloudPrivateIPConfig.Name)
+		egressIPString := cloudPrivateIPConfigNameToIPString(cpipcName)
 		statusItem := egressipv1.EgressIPStatusItem{
 			Node:     nodeToDelete,
 			EgressIP: egressIPString,
@@ -1620,7 +2218,7 @@ func (eIPC *egressIPClusterController) reconcileCloudPrivateIPConfig(old, new *o
 		}
 		for _, resyncEgressIP := range resyncEgressIPs {
 			if err := eIPC.reconcileEgressIP(nil, resyncEgressIP); err != nil {
-				return fmt.Errorf("synthetic update for EgressIP: %s failed, err: %v", egressIP.Name, err)
+				return fmt.Errorf("synthetic update for EgressIP: %s failed, err: %v", egressIPName, err)
 			}
 		}
 	}
@@ -1634,7 +2232,7 @@ func (eIPC *egressIPClusterController) reconcileCloudPrivateIPConfig(old, new *o
 			// officially supported, think of someone creating a CloudPrivateIPConfig object manually which will never
 			// get the annotation.
 			klog.Warningf("CloudPrivateIPConfig object %q is missing the egress IP owner reference annotation. Skipping",
-				oldCloudPrivateIPConfig.Name)
+				newCloudPrivateIPConfig.Name)
 			return nil
 		}
 		egressIP, err := eIPC.kube.GetEgressIP(egressIPName)
@@ -1725,20 +2323,22 @@ func (eIPC *egressIPClusterController) removePendingOpsAndGetResyncs(egressIPNam
 	eIPC.pendingCloudPrivateIPConfigsMutex.Lock()
 	defer eIPC.pendingCloudPrivateIPConfigsMutex.Unlock()
 	ops, pending := eIPC.pendingCloudPrivateIPConfigsOps[egressIPName]
-	if !pending {
-		return nil, fmt.Errorf("no pending operation found for EgressIP: %s", egressIPName)
-	}
-	op, exists := ops[egressIPAddr]
-	if !exists {
-		return nil, fmt.Errorf("pending operations found for EgressIP: %s, but not for the finalized IP: %s", egressIPName, egressIPAddr)
-	}
-	// Make sure we are dealing with a delete operation, since for update
-	// operations will still need to process the add afterwards.
-	if op.toAdd == "" && op.toDelete != "" {
-		delete(ops, egressIPAddr)
-	}
-	if len(ops) == 0 {
-		delete(eIPC.pendingCloudPrivateIPConfigsOps, egressIPName)
+	if pending {
+		op, exists := ops[egressIPAddr]
+		if exists {
+			// Make sure we are dealing with a delete operation, since for update
+			// operations will still need to process the add afterwards.
+			if op.toAdd == "" && op.toDelete != "" {
+				delete(ops, egressIPAddr)
+			}
+			if len(ops) == 0 {
+				delete(eIPC.pendingCloudPrivateIPConfigsOps, egressIPName)
+			}
+		} else {
+			klog.V(5).Infof("Pending operations found for EgressIP: %s, but not for the finalized IP: %s", egressIPName, egressIPAddr)
+		}
+	} else {
+		klog.V(5).Infof("No pending operation found for EgressIP: %s while processing finalized deletion for IP: %s", egressIPName, egressIPAddr)
 	}
 
 	// Some EgressIP objects might not have all of their spec.egressIPs
@@ -1860,15 +2460,11 @@ func (eIPC *egressIPClusterController) ensureAllocatorEgressIPAssignments(egress
 
 // syncEgressIPMarkAllocator iterates over all existing EgressIPs. It builds a mark cache of existing marks stored on each
 // EgressIP annotation or allocates and adds a new mark to an EgressIP if it doesn't exist.
-func (eIPC *egressIPClusterController) syncEgressIPMarkAllocator(egressIPs []interface{}) error {
+func (eIPC *egressIPClusterController) syncEgressIPMarkAllocator(egressIPs []*egressipv1.EgressIP) error {
 	// Reserve previously assigned marks. Note: the allocator cache is pre-populated with
 	// existing assignments from EgressIP statuses in initEgressNodeReachability, which runs
 	// before this sync function.
-	for _, object := range egressIPs {
-		egressIP, ok := object.(*egressipv1.EgressIP)
-		if !ok {
-			return fmt.Errorf("failed to cast %T to *egressipv1.EgressIP", egressIP)
-		}
+	for _, egressIP := range egressIPs {
 		if !util.IsEgressIPMarkSet(egressIP.Annotations) {
 			continue
 		}
@@ -1884,11 +2480,7 @@ func (eIPC *egressIPClusterController) syncEgressIPMarkAllocator(egressIPs []int
 		}
 	}
 	// assign new marks for EgressIPs without a mark
-	for _, object := range egressIPs {
-		egressIP, ok := object.(*egressipv1.EgressIP)
-		if !ok {
-			return fmt.Errorf("failed to cast %T to *egressipv1.EgressIP", egressIP)
-		}
+	for _, egressIP := range egressIPs {
 		if util.IsEgressIPMarkSet(egressIP.Annotations) {
 			continue
 		}

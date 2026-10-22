@@ -84,7 +84,7 @@ func (o *FakeClusterManager) init() {
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	if config.OVNKubernetesFeature.EnableEgressIP {
-		o.eIPC = newEgressIPController(o.fakeClient, o.watcher, o.fakeRecorder)
+		o.eIPC, err = newEgressIPController(o.fakeClient, o.watcher, o.fakeRecorder)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	}
 	if config.OVNKubernetesFeature.EnableEgressService {
