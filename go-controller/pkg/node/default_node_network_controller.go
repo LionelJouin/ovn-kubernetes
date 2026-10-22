@@ -21,6 +21,7 @@ import (
 	discovery "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
@@ -126,12 +127,12 @@ type DefaultNodeNetworkController struct {
 	// queue and event handler for endpoint slices, used for the removal of stale conntrack entries for services
 	conntrackEndpointSliceQueue   workqueue.TypedRateLimitingInterface[string]
 	conntrackEndpointSliceHandler cache.ResourceEventHandlerRegistration
-	conntrackEndpointSliceCache   sync.Map // map[string]*discovery.EndpointSlice
+	conntrackRemovalsLock         sync.Mutex
+	pendingConntrackRemovals      map[string]map[pendingConntrackEndpoint]struct{}
 
 	// queue and event handler for nodes, used for updating routes/nftables rules for node PMTUD guarding
-	nodeQueue     workqueue.TypedRateLimitingInterface[string]
-	nodeHandler   cache.ResourceEventHandlerRegistration
-	remoteNodeIPs sync.Map // map[string][]net.IP
+	nodeQueue   workqueue.TypedRateLimitingInterface[string]
+	nodeHandler cache.ResourceEventHandlerRegistration
 
 	dpuNodeLeaseManager *dpulease.Manager
 
@@ -165,6 +166,7 @@ func newDefaultNodeNetworkController(cnnci *CommonNodeNetworkControllerInfo, sto
 			controller.DefaultRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "node-conntrack-endpointslice"},
 		),
+		pendingConntrackRemovals: make(map[string]map[pendingConntrackEndpoint]struct{}),
 		nodeQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			controller.DefaultRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "node-reconciler"},
@@ -1241,9 +1243,7 @@ func (nc *DefaultNodeNetworkController) startEgressIPHealthCheckingServer(mgmtPo
 }
 
 func (nc *DefaultNodeNetworkController) reconcileConntrackUponEndpointSliceEvents(oldEndpointSlice, newEndpointSlice *discovery.EndpointSlice) error {
-	var errors []error
 	if oldEndpointSlice == nil {
-		// nothing to do upon an add event
 		return nil
 	}
 	namespacedName, err := util.ServiceNamespacedNameFromEndpointSlice(oldEndpointSlice)
@@ -1253,90 +1253,132 @@ func (nc *DefaultNodeNetworkController) reconcileConntrackUponEndpointSliceEvent
 	svc, err := nc.watchFactory.GetService(namespacedName.Namespace, namespacedName.Name)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			klog.V(5).Infof("Service %s/%s not found (might have been deleted) when reconciling conntrack for endpointslice %s",
-				namespacedName.Namespace, namespacedName.Name, oldEndpointSlice.Name)
-			// service is not found, likely deleted, flushing service conntrack entries will be handled at service reconciliation. No-op here.
 			return nil
 		}
 		return fmt.Errorf("error while retrieving service for endpointslice %s/%s when reconciling conntrack: %v",
 			oldEndpointSlice.Namespace, oldEndpointSlice.Name, err)
 	}
-	for _, oldPort := range oldEndpointSlice.Ports {
-		if *oldPort.Protocol != corev1.ProtocolUDP { // flush conntrack only for UDP
+
+	removed := getRemovedUDPEndpoints(oldEndpointSlice, newEndpointSlice, svc)
+	if len(removed) == 0 {
+		return nil
+	}
+	key, err := cache.MetaNamespaceKeyFunc(oldEndpointSlice)
+	if err != nil {
+		return err
+	}
+
+	nc.conntrackRemovalsLock.Lock()
+	if nc.pendingConntrackRemovals == nil {
+		nc.pendingConntrackRemovals = make(map[string]map[pendingConntrackEndpoint]struct{})
+	}
+	if nc.pendingConntrackRemovals[key] == nil {
+		nc.pendingConntrackRemovals[key] = make(map[pendingConntrackEndpoint]struct{})
+	}
+	for _, ep := range removed {
+		nc.pendingConntrackRemovals[key][ep] = struct{}{}
+	}
+	nc.conntrackRemovalsLock.Unlock()
+
+	return nc.reconcileEndpointSliceConntrack(key)
+}
+
+type pendingConntrackEndpoint struct {
+	serviceNamespacedName k8stypes.NamespacedName
+	endpointIP            string
+	portName              string
+	port                  int32
+	protocol              corev1.Protocol
+}
+
+func getRemovedUDPEndpoints(oldEPS, newEPS *discovery.EndpointSlice, svc *corev1.Service) []pendingConntrackEndpoint {
+	if oldEPS == nil {
+		return nil
+	}
+	svcNN, err := util.ServiceNamespacedNameFromEndpointSlice(oldEPS)
+	if err != nil {
+		return nil
+	}
+
+	newHasService := newEPS != nil && (!util.IsNetworkSegmentationSupportEnabled() || newEPS.Labels[discovery.LabelServiceName] != "")
+
+	var removed []pendingConntrackEndpoint
+	for _, oldPort := range oldEPS.Ports {
+		if oldPort.Protocol == nil || *oldPort.Protocol != corev1.ProtocolUDP || oldPort.Port == nil {
 			continue
 		}
-		for _, oldEndpoint := range oldEndpointSlice.Endpoints {
+		portName := ""
+		if oldPort.Name != nil {
+			portName = *oldPort.Name
+		}
+		for _, oldEndpoint := range oldEPS.Endpoints {
 			for _, oldIP := range oldEndpoint.Addresses {
 				oldIPStr := utilnet.ParseIPSloppy(oldIP).String()
-				// upon an update event, remove conntrack entries for IP addresses that are no longer
-				// in the endpointslice, skip otherwise
-				if newEndpointSlice != nil && util.DoesEndpointSliceContainEligibleEndpoint(newEndpointSlice, oldIPStr, *oldPort.Port, *oldPort.Protocol, svc) {
+				if newEPS != nil && !util.DoesEndpointSliceContainEligibleEndpoint(oldEPS, oldIPStr, *oldPort.Port, *oldPort.Protocol, svc) {
 					continue
 				}
-				portName := ""
-				if oldPort.Name != nil {
-					portName = *oldPort.Name
-				}
-				servicePort, err := util.FindServicePortForEndpointSlicePort(svc, portName, *oldPort.Protocol)
-				if err != nil {
-					klog.Errorf("Failed to get service port for endpoint %s: %v", oldIPStr, err)
+				if newHasService && util.DoesEndpointSliceContainEligibleEndpoint(newEPS, oldIPStr, *oldPort.Port, *oldPort.Protocol, svc) {
 					continue
 				}
-				// upon update and delete events, flush UDP conntrack for Service port
-				if _, err := util.DeleteConntrackServicePort(oldIPStr, servicePort.Port, *oldPort.Protocol,
-					netlink.ConntrackReplyAnyIP, nil); err != nil {
-					klog.Errorf("Failed to delete conntrack entry for %s port %d: %v", oldIPStr, servicePort.Port, err)
-					errors = append(errors, err)
-				}
-
-				// Flush UDP conntrack entries for NodePort (and LoadBalancer services that allocate NodePorts)
-				// TODO: Once vishvananda/netlink support ConntrackFilterType '--reply-port-src', we can use one DeleteConntrackServicePort() call
-				//       conntrack entries for both ClusterIP and NodePort.
-				if util.ServiceTypeHasNodePort(svc) && servicePort.NodePort > 0 {
-					if _, err := util.DeleteConntrackServicePort(oldIPStr, servicePort.NodePort, *oldPort.Protocol,
-						netlink.ConntrackReplyAnyIP, nil); err != nil {
-						klog.Errorf("Failed to delete conntrack entry for %s NodePort %d: %v", oldIPStr, servicePort.NodePort, err)
-						errors = append(errors, err)
-					}
-				}
+				removed = append(removed, pendingConntrackEndpoint{
+					serviceNamespacedName: svcNN,
+					endpointIP:            oldIPStr,
+					portName:              portName,
+					port:                  *oldPort.Port,
+					protocol:              *oldPort.Protocol,
+				})
 			}
 		}
 	}
-	return utilerrors.Join(errors...)
-
+	return removed
 }
 
-func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceAdd(obj interface{}) {
-	eps, ok := obj.(*discovery.EndpointSlice)
-	if !ok {
-		return
-	}
-	if util.IsNetworkSegmentationSupportEnabled() && eps.Labels[discovery.LabelServiceName] == "" {
-		return
-	}
-	key, err := cache.MetaNamespaceKeyFunc(eps)
-	if err != nil {
-		return
-	}
-	// Keep a pending prior state; the worker advances the cache after reconciling.
-	nc.conntrackEndpointSliceCache.LoadOrStore(key, eps)
+func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceAdd(_ interface{}) {
+	// Nothing to do upon an add event: no stale UDP conntrack entries exist for newly added slices.
 }
 
 func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceUpdate(oldObj, newObj interface{}) {
-	newEPS, ok := newObj.(*discovery.EndpointSlice)
-	if !ok {
+	oldEPS, ok1 := oldObj.(*discovery.EndpointSlice)
+	newEPS, ok2 := newObj.(*discovery.EndpointSlice)
+	if !ok1 || !ok2 {
 		return
 	}
 	if util.IsNetworkSegmentationSupportEnabled() && newEPS.Labels[discovery.LabelServiceName] == "" {
-		oldEPS, oldOK := oldObj.(*discovery.EndpointSlice)
-		if !oldOK || oldEPS.Labels[discovery.LabelServiceName] == "" {
+		if oldEPS.Labels[discovery.LabelServiceName] == "" {
 			return
 		}
 	}
+
+	var svc *corev1.Service
+	if nc.watchFactory != nil {
+		svcNN, err := util.ServiceNamespacedNameFromEndpointSlice(oldEPS)
+		if err == nil {
+			svc, _ = nc.watchFactory.GetService(svcNN.Namespace, svcNN.Name)
+		}
+	}
+
+	removed := getRemovedUDPEndpoints(oldEPS, newEPS, svc)
+	if len(removed) == 0 {
+		return
+	}
+
 	key, err := cache.MetaNamespaceKeyFunc(newEPS)
 	if err != nil {
 		return
 	}
+
+	nc.conntrackRemovalsLock.Lock()
+	if nc.pendingConntrackRemovals == nil {
+		nc.pendingConntrackRemovals = make(map[string]map[pendingConntrackEndpoint]struct{})
+	}
+	if nc.pendingConntrackRemovals[key] == nil {
+		nc.pendingConntrackRemovals[key] = make(map[pendingConntrackEndpoint]struct{})
+	}
+	for _, ep := range removed {
+		nc.pendingConntrackRemovals[key][ep] = struct{}{}
+	}
+	nc.conntrackRemovalsLock.Unlock()
+
 	nc.conntrackEndpointSliceQueue.Add(key)
 }
 
@@ -1355,10 +1397,37 @@ func (nc *DefaultNodeNetworkController) onConntrackEndpointSliceDelete(obj inter
 	if util.IsNetworkSegmentationSupportEnabled() && eps.Labels[discovery.LabelServiceName] == "" {
 		return
 	}
+
+	var svc *corev1.Service
+	if nc.watchFactory != nil {
+		svcNN, err := util.ServiceNamespacedNameFromEndpointSlice(eps)
+		if err == nil {
+			svc, _ = nc.watchFactory.GetService(svcNN.Namespace, svcNN.Name)
+		}
+	}
+
+	removed := getRemovedUDPEndpoints(eps, nil, svc)
+	if len(removed) == 0 {
+		return
+	}
+
 	key, err := cache.MetaNamespaceKeyFunc(eps)
 	if err != nil {
 		return
 	}
+
+	nc.conntrackRemovalsLock.Lock()
+	if nc.pendingConntrackRemovals == nil {
+		nc.pendingConntrackRemovals = make(map[string]map[pendingConntrackEndpoint]struct{})
+	}
+	if nc.pendingConntrackRemovals[key] == nil {
+		nc.pendingConntrackRemovals[key] = make(map[pendingConntrackEndpoint]struct{})
+	}
+	for _, ep := range removed {
+		nc.pendingConntrackRemovals[key][ep] = struct{}{}
+	}
+	nc.conntrackRemovalsLock.Unlock()
+
 	nc.conntrackEndpointSliceQueue.Add(key)
 }
 
@@ -1382,11 +1451,9 @@ func (nc *DefaultNodeNetworkController) processConntrackEndpointSliceItem() bool
 			return true
 		}
 		klog.Errorf("Dropping EndpointSlice %s conntrack flush out of queue: %v", key, err)
-		if ns, name, splitErr := cache.SplitMetaNamespaceKey(key); splitErr == nil {
-			if curEPS, getErr := nc.watchFactory.GetEndpointSlice(ns, name); apierrors.IsNotFound(getErr) || (getErr == nil && util.IsNetworkSegmentationSupportEnabled() && curEPS.Labels[discovery.LabelServiceName] == "") {
-				nc.conntrackEndpointSliceCache.Delete(key)
-			}
-		}
+		nc.conntrackRemovalsLock.Lock()
+		delete(nc.pendingConntrackRemovals, key)
+		nc.conntrackRemovalsLock.Unlock()
 	}
 	nc.conntrackEndpointSliceQueue.Forget(key)
 	return true
@@ -1398,46 +1465,111 @@ func (nc *DefaultNodeNetworkController) reconcileEndpointSliceConntrack(key stri
 		return fmt.Errorf("failed to split key %s: %w", key, err)
 	}
 
-	oldVal, hadOld := nc.conntrackEndpointSliceCache.Load(key)
-	curEPS, err := nc.watchFactory.GetEndpointSlice(namespace, name)
+	nc.conntrackRemovalsLock.Lock()
+	pendingSet := nc.pendingConntrackRemovals[key]
+	delete(nc.pendingConntrackRemovals, key)
+	nc.conntrackRemovalsLock.Unlock()
 
+	if len(pendingSet) == 0 {
+		return nil
+	}
+
+	curEPS, getErr := nc.watchFactory.GetEndpointSlice(namespace, name)
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		nc.conntrackRemovalsLock.Lock()
+		if nc.pendingConntrackRemovals == nil {
+			nc.pendingConntrackRemovals = make(map[string]map[pendingConntrackEndpoint]struct{})
+		}
+		if nc.pendingConntrackRemovals[key] == nil {
+			nc.pendingConntrackRemovals[key] = pendingSet
+		} else {
+			for ep := range pendingSet {
+				nc.pendingConntrackRemovals[key][ep] = struct{}{}
+			}
+		}
+		nc.conntrackRemovalsLock.Unlock()
+		return fmt.Errorf("failed to get EndpointSlice %s: %w", key, getErr)
+	}
+
+	// All endpoints in this EndpointSlice belong to the same Service
+	var svcNN k8stypes.NamespacedName
+	for ep := range pendingSet {
+		svcNN = ep.serviceNamespacedName
+		break
+	}
+
+	svc, err := nc.watchFactory.GetService(svcNN.Namespace, svcNN.Name)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			if hadOld {
-				oldEPS := oldVal.(*discovery.EndpointSlice)
-				if err := nc.reconcileConntrackUponEndpointSliceEvents(oldEPS, nil); err != nil {
-					return err
-				}
-				nc.conntrackEndpointSliceCache.CompareAndDelete(key, oldVal)
-				return nil
-			}
+			// Service is not found, likely deleted; flushing service conntrack entries
+			// will be handled at service reconciliation. No-op here.
 			return nil
 		}
-		return fmt.Errorf("failed to get EndpointSlice %s: %w", key, err)
-	}
-
-	if util.IsNetworkSegmentationSupportEnabled() && curEPS.Labels[discovery.LabelServiceName] == "" {
-		if hadOld {
-			oldEPS := oldVal.(*discovery.EndpointSlice)
-			if err := nc.reconcileConntrackUponEndpointSliceEvents(oldEPS, nil); err != nil {
-				return err
+		nc.conntrackRemovalsLock.Lock()
+		if nc.pendingConntrackRemovals == nil {
+			nc.pendingConntrackRemovals = make(map[string]map[pendingConntrackEndpoint]struct{})
+		}
+		if nc.pendingConntrackRemovals[key] == nil {
+			nc.pendingConntrackRemovals[key] = pendingSet
+		} else {
+			for ep := range pendingSet {
+				nc.pendingConntrackRemovals[key][ep] = struct{}{}
 			}
-			nc.conntrackEndpointSliceCache.CompareAndDelete(key, oldVal)
 		}
-		return nil
+		nc.conntrackRemovalsLock.Unlock()
+		return fmt.Errorf("error while retrieving service %s for EndpointSlice %s: %w", svcNN, key, err)
 	}
 
-	if hadOld {
-		oldEPS := oldVal.(*discovery.EndpointSlice)
-		if err := nc.reconcileConntrackUponEndpointSliceEvents(oldEPS, curEPS); err != nil {
-			return err
+	var errors []error
+	unrecovered := make(map[pendingConntrackEndpoint]struct{})
+
+	for ep := range pendingSet {
+		// If current EndpointSlice still contains this endpoint as eligible, skip flushing
+		if getErr == nil && (!util.IsNetworkSegmentationSupportEnabled() || curEPS.Labels[discovery.LabelServiceName] != "") {
+			if util.DoesEndpointSliceContainEligibleEndpoint(curEPS, ep.endpointIP, ep.port, ep.protocol, svc) {
+				continue
+			}
 		}
-		nc.conntrackEndpointSliceCache.Store(key, curEPS)
-		return nil
+
+		servicePort, err := util.FindServicePortForEndpointSlicePort(svc, ep.portName, ep.protocol)
+		if err != nil {
+			klog.Errorf("Failed to get service port for endpoint %s: %v", ep.endpointIP, err)
+			continue
+		}
+
+		if _, err := util.DeleteConntrackServicePort(ep.endpointIP, servicePort.Port, ep.protocol,
+			netlink.ConntrackReplyAnyIP, nil); err != nil {
+			klog.Errorf("Failed to delete conntrack entry for %s port %d: %v", ep.endpointIP, servicePort.Port, err)
+			unrecovered[ep] = struct{}{}
+			errors = append(errors, err)
+		}
+
+		if util.ServiceTypeHasNodePort(svc) && servicePort.NodePort > 0 {
+			if _, err := util.DeleteConntrackServicePort(ep.endpointIP, servicePort.NodePort, ep.protocol,
+				netlink.ConntrackReplyAnyIP, nil); err != nil {
+				klog.Errorf("Failed to delete conntrack entry for %s NodePort %d: %v", ep.endpointIP, servicePort.NodePort, err)
+				unrecovered[ep] = struct{}{}
+				errors = append(errors, err)
+			}
+		}
 	}
 
-	nc.conntrackEndpointSliceCache.Store(key, curEPS)
-	return nil
+	if len(unrecovered) > 0 {
+		nc.conntrackRemovalsLock.Lock()
+		if nc.pendingConntrackRemovals == nil {
+			nc.pendingConntrackRemovals = make(map[string]map[pendingConntrackEndpoint]struct{})
+		}
+		if nc.pendingConntrackRemovals[key] == nil {
+			nc.pendingConntrackRemovals[key] = unrecovered
+		} else {
+			for ep := range unrecovered {
+				nc.pendingConntrackRemovals[key][ep] = struct{}{}
+			}
+		}
+		nc.conntrackRemovalsLock.Unlock()
+	}
+
+	return utilerrors.Join(errors...)
 }
 
 func (nc *DefaultNodeNetworkController) WatchEndpointSlices(ctx context.Context, workers int) error {
@@ -1512,9 +1644,6 @@ func (nc *DefaultNodeNetworkController) processNodeItem() bool {
 			return true
 		}
 		klog.Errorf("Dropping node %s out of queue after %d attempts: %v", nodeName, controller.DefaultMaxAttempts, err)
-		if _, getErr := nc.watchFactory.GetNode(nodeName); apierrors.IsNotFound(getErr) {
-			nc.remoteNodeIPs.Delete(nodeName)
-		}
 	}
 	nc.nodeQueue.Forget(nodeName)
 	return true
@@ -1529,11 +1658,7 @@ func (nc *DefaultNodeNetworkController) WatchNodes(ctx context.Context, workers 
 	if err != nil {
 		return fmt.Errorf("failed to get nodes for initial sync: %w", err)
 	}
-	nodeObjs := make([]interface{}, len(nodes))
-	for i, n := range nodes {
-		nodeObjs[i] = n
-	}
-	if err := nc.syncNodes(nodeObjs); err != nil {
+	if err := nc.syncNodes(nodes); err != nil {
 		return fmt.Errorf("failed initial node sync: %w", err)
 	}
 
@@ -1606,43 +1731,21 @@ func (nc *DefaultNodeNetworkController) reconcileLocalNode(node *corev1.Node) er
 }
 
 func (nc *DefaultNodeNetworkController) reconcileRemoteNode(node *corev1.Node) error {
-	newIPsv4, newIPsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, node)
+	ipsv4, ipsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, node)
 	if err != nil {
 		return fmt.Errorf("failed to get addresses for node %q: %w", node.Name, err)
 	}
 
-	newIPs := make([]net.IP, 0, len(newIPsv4)+len(newIPsv6))
-	newIPs = append(newIPs, newIPsv4...)
-	newIPs = append(newIPs, newIPsv6...)
-
-	ipsToKeep := map[string]bool{}
-	for _, ip := range newIPs {
-		ipsToKeep[ip.String()] = true
+	addrs := make([]string, 0, len(ipsv4)+len(ipsv6))
+	for _, nodeIP := range append(ipsv4, ipsv6...) {
+		addrs = append(addrs, nodeIP.String())
 	}
 
-	if config.IsModeDPUHost() || config.IsModeFull() {
-		if oldIPsVal, ok := nc.remoteNodeIPs.Load(node.Name); ok {
-			oldIPs := oldIPsVal.([]net.IP)
-			ipsToRemove := make([]net.IP, 0)
-			for _, oldIP := range oldIPs {
-				if !ipsToKeep[oldIP.String()] {
-					ipsToRemove = append(ipsToRemove, oldIP)
-				}
-			}
-			if len(ipsToRemove) > 0 {
-				if err := removePMTUDNodeNFTRules(ipsToRemove); err != nil {
-					return fmt.Errorf("error removing node %q stale NFT rules during update: %w", node.Name, err)
-				}
-			}
-		}
+	if gw, ok := nc.Gateway.(*gateway); ok && gw.openflowManager != nil {
+		gw.openflowManager.updateBridgePMTUDFlowCache(getPMTUDKey(node.Name), addrs)
 	}
 
-	if err := nc.addOrUpdateNode(node); err != nil {
-		return err
-	}
-
-	nc.remoteNodeIPs.Store(node.Name, newIPs)
-	return nil
+	return nc.syncRemoteNodeNFTRules()
 }
 
 func (nc *DefaultNodeNetworkController) deleteNode(nodeName string) error {
@@ -1658,15 +1761,8 @@ func (nc *DefaultNodeNetworkController) deleteNode(nodeName string) error {
 		gw.openflowManager.deleteFlowsByKey(getPMTUDKey(nodeName))
 	}
 
-	if oldIPsVal, ok := nc.remoteNodeIPs.Load(nodeName); ok {
-		if config.IsModeDPUHost() || config.IsModeFull() {
-			ipsToRemove := oldIPsVal.([]net.IP)
-			klog.Infof("Deleting NFT elements for node: %s", nodeName)
-			if err := removePMTUDNodeNFTRules(ipsToRemove); err != nil {
-				return fmt.Errorf("failed to delete nftables rules for PMTUD blocking for node %q: %w", nodeName, err)
-			}
-		}
-		nc.remoteNodeIPs.Delete(nodeName)
+	if err := nc.syncRemoteNodeNFTRules(); err != nil {
+		return fmt.Errorf("failed to sync nftables rules on node %q deletion: %w", nodeName, err)
 	}
 
 	if nodeName == nc.name && (config.IsModeDPUHost() || config.IsModeFull()) {
@@ -1677,79 +1773,6 @@ func (nc *DefaultNodeNetworkController) deleteNode(nodeName string) error {
 		}
 	}
 
-	return nil
-}
-
-// addOrUpdateNode handles creating flows or nftables rules for each node to handle PMTUD
-func (nc *DefaultNodeNetworkController) addOrUpdateNode(node *corev1.Node) error {
-	var nftElems []knftables.Object
-	var addrs []string
-
-	// Use GetNodeAddresses to get all node IPs (including current node for openflow)
-	ipsv4, ipsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, node)
-	if err != nil {
-		return fmt.Errorf("failed to get node addresses for node %q: %w", node.Name, err)
-	}
-
-	// Process IPv4 addresses
-	for _, nodeIP := range ipsv4 {
-		addrs = append(addrs, nodeIP.String())
-		klog.Infof("Adding remote node %q, IP: %s to PMTUD blocking rules", node.Name, nodeIP)
-		// Only add to nftables if this is remote node
-		if (config.IsModeDPUHost() || config.IsModeFull()) && node.Name != nc.name {
-			nftElems = append(nftElems, &knftables.Element{
-				Set: types.NFTRemoteNodeIPsv4,
-				Key: []string{nodeIP.String()},
-			})
-		}
-	}
-
-	// Process IPv6 addresses
-	for _, nodeIP := range ipsv6 {
-		addrs = append(addrs, nodeIP.String())
-		klog.Infof("Adding remote node %q, IP: %s to PMTUD blocking rules", node.Name, nodeIP)
-		// Only add to nftables if this is remote node
-		if (config.IsModeDPUHost() || config.IsModeFull()) && node.Name != nc.name {
-			nftElems = append(nftElems, &knftables.Element{
-				Set: types.NFTRemoteNodeIPsv6,
-				Key: []string{nodeIP.String()},
-			})
-		}
-	}
-	if (config.IsModeDPUHost() || config.IsModeFull()) && len(nftElems) > 0 {
-		if err := nodenft.AddObjects(nftElems); err != nil {
-			return fmt.Errorf("unable to update NFT elements for node %q, error: %w", node.Name, err)
-		}
-	}
-
-	if gw, ok := nc.Gateway.(*gateway); ok && gw.openflowManager != nil {
-		gw.openflowManager.updateBridgePMTUDFlowCache(getPMTUDKey(node.Name), addrs)
-	}
-
-	return nil
-}
-
-func removePMTUDNodeNFTRules(nodeIPs []net.IP) error {
-	var nftElems []knftables.Object
-	for _, nodeIP := range nodeIPs {
-		// Remove IPs from NFT sets
-		if utilnet.IsIPv4(nodeIP) {
-			nftElems = append(nftElems, &knftables.Element{
-				Set: types.NFTRemoteNodeIPsv4,
-				Key: []string{nodeIP.String()},
-			})
-		} else {
-			nftElems = append(nftElems, &knftables.Element{
-				Set: types.NFTRemoteNodeIPsv6,
-				Key: []string{nodeIP.String()},
-			})
-		}
-	}
-	if len(nftElems) > 0 {
-		if err := nodenft.DeleteObjects(nftElems); err != nil {
-			return fmt.Errorf("unable to remove PMTUD rules for nodes: %w", err)
-		}
-	}
 	return nil
 }
 
@@ -1770,46 +1793,35 @@ var nodeIPSets = []knftables.Object{
 	},
 }
 
-func (nc *DefaultNodeNetworkController) syncNodes(objs []interface{}) error {
-	var keepNFTSetElems []knftables.Object
-
-	if config.IsModeDPU() {
+func (nc *DefaultNodeNetworkController) syncRemoteNodeNFTRules() error {
+	if config.IsModeDPU() || !(config.IsModeDPUHost() || config.IsModeFull()) {
 		return nil
 	}
 
-	klog.Infof("Starting node controller node sync")
-	start := time.Now()
-	for _, obj := range objs {
-		node, ok := obj.(*corev1.Node)
-		if !ok {
-			klog.Errorf("Spurious object in syncNodes: %v", obj)
-			continue
-		}
+	nodes, err := nc.watchFactory.GetNodes()
+	if err != nil {
+		return fmt.Errorf("failed to list nodes for PMTUD sync: %w", err)
+	}
+	return nc.syncRemoteNodeNFTRulesWithNodes(nodes)
+}
+
+func (nc *DefaultNodeNetworkController) syncRemoteNodeNFTRulesWithNodes(nodes []*corev1.Node) error {
+	var keepNFTSetElems []knftables.Object
+	for _, node := range nodes {
 		if node.Name == nc.name {
 			continue
 		}
-
-		// Use GetNodeAddresses to get node IPs
 		ipsv4, ipsv6, err := util.GetNodeAddresses(config.IPv4Mode, config.IPv6Mode, node)
 		if err != nil {
-			klog.Errorf("Failed to get node addresses for node %q: %v", node.Name, err)
+			klog.V(5).Infof("Could not get node addresses for %s: %v", node.Name, err)
 			continue
 		}
-
-		// Process IPv4 addresses
-		nodeIPs := make([]net.IP, 0, len(ipsv4)+len(ipsv6))
-		nodeIPs = append(nodeIPs, ipsv4...)
-		nodeIPs = append(nodeIPs, ipsv6...)
-		nc.remoteNodeIPs.Store(node.Name, nodeIPs)
-
 		for _, nodeIP := range ipsv4 {
 			keepNFTSetElems = append(keepNFTSetElems, &knftables.Element{
 				Set: types.NFTRemoteNodeIPsv4,
 				Key: []string{nodeIP.String()},
 			})
 		}
-
-		// Process IPv6 addresses
 		for _, nodeIP := range ipsv6 {
 			keepNFTSetElems = append(keepNFTSetElems, &knftables.Element{
 				Set: types.NFTRemoteNodeIPsv6,
@@ -1817,11 +1829,20 @@ func (nc *DefaultNodeNetworkController) syncNodes(objs []interface{}) error {
 			})
 		}
 	}
-	err := nodenft.SyncObjects(nodeIPSets, keepNFTSetElems)
-	if err != nil {
-		err = fmt.Errorf("unable to sync nftables rules for nodes: %w", err)
+	if err := nodenft.SyncObjects(nodeIPSets, keepNFTSetElems); err != nil {
+		return fmt.Errorf("unable to sync nftables rules for nodes: %w", err)
+	}
+	return nil
+}
+
+func (nc *DefaultNodeNetworkController) syncNodes(nodes []*corev1.Node) error {
+	if config.IsModeDPU() || !(config.IsModeDPUHost() || config.IsModeFull()) {
+		return nil
 	}
 
+	klog.Infof("Starting node controller node sync")
+	start := time.Now()
+	err := nc.syncRemoteNodeNFTRulesWithNodes(nodes)
 	klog.Infof("Node controller node sync done. Time taken: %s", time.Since(start))
 	return err
 }

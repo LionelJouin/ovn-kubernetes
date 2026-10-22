@@ -23,6 +23,7 @@ import (
 	discovery "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
@@ -2357,23 +2358,23 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			}()),
 		)
 
-		It("onConntrackEndpointSliceAdd does not overwrite existing cache entry", func() {
-			nc := &DefaultNodeNetworkController{}
-			key := "default/test-eps"
-			eps1 := &discovery.EndpointSlice{
+		It("onConntrackEndpointSliceAdd is a no-op that does not enqueue", func() {
+			q := workqueue.NewTypedRateLimitingQueueWithConfig(
+				controller.DefaultRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "test-queue"},
+			)
+			defer q.ShutDown()
+			nc := &DefaultNodeNetworkController{
+				conntrackEndpointSliceQueue: q,
+			}
+			eps := &discovery.EndpointSlice{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-eps", Namespace: "default"},
 			}
-			eps2 := &discovery.EndpointSlice{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-eps", Namespace: "default", ResourceVersion: "2"},
-			}
-			nc.conntrackEndpointSliceCache.Store(key, eps1)
-			nc.onConntrackEndpointSliceAdd(eps2)
-			val, ok := nc.conntrackEndpointSliceCache.Load(key)
-			Expect(ok).To(BeTrue())
-			Expect(val).To(Equal(eps1))
+			nc.onConntrackEndpointSliceAdd(eps)
+			Expect(q.Len()).To(Equal(0))
 		})
 
-		It("onConntrackEndpointSliceUpdate enqueues EndpointSlice when service label is removed", func() {
+		It("onConntrackEndpointSliceUpdate enqueues EndpointSlice and records removals when service label is removed", func() {
 			Expect(config.PrepareTestConfig()).To(Succeed())
 			config.OVNKubernetesFeature.EnableMultiNetwork = true
 			config.OVNKubernetesFeature.EnableNetworkSegmentation = true
@@ -2387,6 +2388,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			defer q.ShutDown()
 			nc := &DefaultNodeNetworkController{
 				conntrackEndpointSliceQueue: q,
+				pendingConntrackRemovals:    make(map[string]map[pendingConntrackEndpoint]struct{}),
 			}
 			oldEPS := &discovery.EndpointSlice{
 				ObjectMeta: metav1.ObjectMeta{
@@ -2395,6 +2397,12 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					Labels: map[string]string{
 						discovery.LabelServiceName: "test-service",
 					},
+				},
+				Ports: []discovery.EndpointPort{
+					{Name: strPtr("http"), Port: &testEndpointPort1, Protocol: &udpProtocol},
+				},
+				Endpoints: []discovery.Endpoint{
+					{Addresses: []string{"10.0.0.1"}},
 				},
 			}
 			newEPS := &discovery.EndpointSlice{
@@ -2408,6 +2416,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			Expect(q.Len()).To(Equal(1))
 			item, _ := q.Get()
 			Expect(item).To(Equal("default/test-eps"))
+			Expect(nc.pendingConntrackRemovals["default/test-eps"]).To(HaveLen(1))
 
 			By("not enqueuing when both old and new EndpointSlices lack service label")
 			unlabeledOld := &discovery.EndpointSlice{
@@ -2428,7 +2437,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			Expect(q.Len()).To(Equal(0))
 		})
 
-		It("reconcileEndpointSliceConntrack flushes conntrack using cached state on deletion", func() {
+		It("reconcileEndpointSliceConntrack flushes conntrack using pending removals on deletion", func() {
 			mockNetLinkOps := new(utilMocks.NetLinkOps)
 			util.SetNetLinkOpMockInst(mockNetLinkOps)
 			defer util.ResetNetLinkOpMockInst()
@@ -2450,35 +2459,54 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			defer wf.Shutdown()
 			Expect(wf.Start()).To(Succeed())
 
+			key := "test-ns/test-endpointslice"
 			nc := &DefaultNodeNetworkController{
 				BaseNodeNetworkController: BaseNodeNetworkController{
 					CommonNodeNetworkControllerInfo: CommonNodeNetworkControllerInfo{
 						watchFactory: wf,
 					},
 				},
+				pendingConntrackRemovals: map[string]map[pendingConntrackEndpoint]struct{}{
+					key: {
+						{
+							serviceNamespacedName: k8stypes.NamespacedName{Namespace: "test-ns", Name: "test-service"},
+							endpointIP:            "10.0.0.1",
+							portName:              "http",
+							port:                  testEndpointPort1,
+							protocol:              udpProtocol,
+						}: {},
+					},
+				},
 			}
-
-			key := "test-ns/test-endpointslice"
-			cachedEPS := makeEndpointSlice([]endpointPortConfig{
-				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
-			}, []string{"10.0.0.1"})
-			nc.conntrackEndpointSliceCache.Store(key, cachedEPS)
 
 			// EndpointSlice does not exist in fakeClient (deleted)
 			Expect(nc.reconcileEndpointSliceConntrack(key)).To(Succeed())
 			mockNetLinkOps.AssertExpectations(GinkgoT())
 
-			_, inCache := nc.conntrackEndpointSliceCache.Load(key)
-			Expect(inCache).To(BeFalse())
+			Expect(nc.pendingConntrackRemovals[key]).To(BeEmpty())
 		})
 
-		It("reconcileEndpointSliceConntrack does not delete newly seeded cache entry if added during deletion", func() {
+		It("flushes conntrack when an endpoint is added and removed before the worker runs (A -> A+B -> A)", func() {
 			mockNetLinkOps := new(utilMocks.NetLinkOps)
 			util.SetNetLinkOpMockInst(mockNetLinkOps)
 			defer util.ResetNetLinkOpMockInst()
 
+			mockNetLinkOps.On("ConntrackDeleteFilters",
+				mock.AnythingOfType("netlink.ConntrackTableType"),
+				mock.AnythingOfType("netlink.InetFamily"),
+				mock.AnythingOfType("*netlink.ConntrackFilter")).
+				Return(uint(1), nil).Once()
+
 			svc := makeService([]servicePortConfig{{name: "http", port: testServicePort1, targetPort: testEndpointPort1, protocol: udpProtocol}})
-			fakeClient := fake.NewSimpleClientset(svc)
+			epsA := makeEndpointSlice([]endpointPortConfig{
+				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
+			}, []string{"10.0.0.1"})
+
+			epsAB := makeEndpointSlice([]endpointPortConfig{
+				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
+			}, []string{"10.0.0.1", "10.0.0.2"})
+
+			fakeClient := fake.NewSimpleClientset(svc, epsA)
 
 			wf, err := factory.NewNodeWatchFactory(&util.OVNNodeClientset{
 				KubeClient:            fakeClient,
@@ -2488,44 +2516,165 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			defer wf.Shutdown()
 			Expect(wf.Start()).To(Succeed())
 
+			q := workqueue.NewTypedRateLimitingQueueWithConfig(
+				controller.DefaultRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "test-eps-queue"},
+			)
+			defer q.ShutDown()
+
 			nc := &DefaultNodeNetworkController{
 				BaseNodeNetworkController: BaseNodeNetworkController{
 					CommonNodeNetworkControllerInfo: CommonNodeNetworkControllerInfo{
 						watchFactory: wf,
 					},
 				},
+				conntrackEndpointSliceQueue: q,
+				pendingConntrackRemovals:    make(map[string]map[pendingConntrackEndpoint]struct{}),
 			}
 
 			key := "test-ns/test-endpointslice"
-			oldEPS := makeEndpointSlice([]endpointPortConfig{
-				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
-			}, []string{"10.0.0.1"})
-			nc.conntrackEndpointSliceCache.Store(key, oldEPS)
 
-			newEPS := makeEndpointSlice([]endpointPortConfig{
-				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
-			}, []string{"10.0.0.2"})
+			// Initial add of A
+			nc.onConntrackEndpointSliceAdd(epsA)
+
+			// Update A -> A+B (B added)
+			nc.onConntrackEndpointSliceUpdate(epsA, epsAB)
+
+			// Update A+B -> A (B removed before worker ran)
+			nc.onConntrackEndpointSliceUpdate(epsAB, epsA)
+
+			// Verify workqueue coalesced to only 1 item
+			Expect(q.Len()).To(Equal(1))
+
+			// Run reconcile: endpoint B must be flushed even though current state in informer is A
+			Expect(nc.reconcileEndpointSliceConntrack(key)).To(Succeed())
+			mockNetLinkOps.AssertExpectations(GinkgoT())
+			Expect(nc.pendingConntrackRemovals[key]).To(BeEmpty())
+		})
+
+		It("flushes conntrack when an endpoint transitions from ready to unready", func() {
+			mockNetLinkOps := new(utilMocks.NetLinkOps)
+			util.SetNetLinkOpMockInst(mockNetLinkOps)
+			defer util.ResetNetLinkOpMockInst()
 
 			mockNetLinkOps.On("ConntrackDeleteFilters",
 				mock.AnythingOfType("netlink.ConntrackTableType"),
 				mock.AnythingOfType("netlink.InetFamily"),
 				mock.AnythingOfType("*netlink.ConntrackFilter")).
-				Run(func(_ mock.Arguments) {
-					// Simulate concurrent Add event storing newEPS before CompareAndDelete
-					nc.conntrackEndpointSliceCache.Store(key, newEPS)
-				}).
 				Return(uint(1), nil).Once()
 
+			svc := makeService([]servicePortConfig{{name: "http", port: testServicePort1, targetPort: testEndpointPort1, protocol: udpProtocol}})
+			epsReady := makeEndpointSlice([]endpointPortConfig{
+				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
+			}, []string{"10.0.0.1"})
+
+			epsUnready := makeEndpointSlice([]endpointPortConfig{
+				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
+			}, []string{"10.0.0.1"})
+			isReady := false
+			epsUnready.Endpoints[0].Conditions.Ready = &isReady
+
+			fakeClient := fake.NewSimpleClientset(svc, epsUnready)
+
+			wf, err := factory.NewNodeWatchFactory(&util.OVNNodeClientset{
+				KubeClient:            fakeClient,
+				NetworkAttchDefClient: nadfake.NewSimpleClientset(),
+			}, "test-node")
+			Expect(err).NotTo(HaveOccurred())
+			defer wf.Shutdown()
+			Expect(wf.Start()).To(Succeed())
+
+			q := workqueue.NewTypedRateLimitingQueueWithConfig(
+				controller.DefaultRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "test-eps-queue"},
+			)
+			defer q.ShutDown()
+
+			nc := &DefaultNodeNetworkController{
+				BaseNodeNetworkController: BaseNodeNetworkController{
+					CommonNodeNetworkControllerInfo: CommonNodeNetworkControllerInfo{
+						watchFactory: wf,
+					},
+				},
+				conntrackEndpointSliceQueue: q,
+				pendingConntrackRemovals:    make(map[string]map[pendingConntrackEndpoint]struct{}),
+			}
+
+			key := "test-ns/test-endpointslice"
+
+			// Event: epsReady -> epsUnready
+			nc.onConntrackEndpointSliceUpdate(epsReady, epsUnready)
+			Expect(q.Len()).To(Equal(1))
+
+			// Run reconcile: endpoint must be flushed because it became unready
 			Expect(nc.reconcileEndpointSliceConntrack(key)).To(Succeed())
 			mockNetLinkOps.AssertExpectations(GinkgoT())
-
-			// Verify newEPS was NOT deleted by CompareAndDelete
-			val, inCache := nc.conntrackEndpointSliceCache.Load(key)
-			Expect(inCache).To(BeTrue())
-			Expect(val).To(Equal(newEPS))
+			Expect(nc.pendingConntrackRemovals[key]).To(BeEmpty())
 		})
 
-		It("reconcileEndpointSliceConntrack flushes conntrack and deletes from cache when service label is removed under segmentation", func() {
+		It("does not flush conntrack for an endpoint that was already unready on subsequent update", func() {
+			mockNetLinkOps := new(utilMocks.NetLinkOps)
+			util.SetNetLinkOpMockInst(mockNetLinkOps)
+			defer util.ResetNetLinkOpMockInst()
+
+			// ConntrackDeleteFilters should NOT be called at all
+			mockNetLinkOps.AssertNotCalled(GinkgoT(), "ConntrackDeleteFilters")
+
+			svc := makeService([]servicePortConfig{{name: "http", port: testServicePort1, targetPort: testEndpointPort1, protocol: udpProtocol}})
+			epsUnready1 := makeEndpointSlice([]endpointPortConfig{
+				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
+			}, []string{"10.0.0.1"})
+			isReady := false
+			isReady2 := true
+			epsUnready1.Endpoints[0].Conditions.Ready = &isReady
+
+			epsUnready2 := makeEndpointSlice([]endpointPortConfig{
+				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
+			}, []string{"10.0.0.1"})
+			epsUnready2.Endpoints = []discovery.Endpoint{
+				{
+					Addresses:  []string{"10.0.0.1"},
+					Conditions: discovery.EndpointConditions{Ready: &isReady},
+				},
+				{
+					Addresses:  []string{"10.0.0.2"},
+					Conditions: discovery.EndpointConditions{Ready: &isReady2},
+				},
+			}
+
+			fakeClient := fake.NewSimpleClientset(svc, epsUnready2)
+
+			wf, err := factory.NewNodeWatchFactory(&util.OVNNodeClientset{
+				KubeClient:            fakeClient,
+				NetworkAttchDefClient: nadfake.NewSimpleClientset(),
+			}, "test-node")
+			Expect(err).NotTo(HaveOccurred())
+			defer wf.Shutdown()
+			Expect(wf.Start()).To(Succeed())
+
+			q := workqueue.NewTypedRateLimitingQueueWithConfig(
+				controller.DefaultRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "test-eps-queue"},
+			)
+			defer q.ShutDown()
+
+			nc := &DefaultNodeNetworkController{
+				BaseNodeNetworkController: BaseNodeNetworkController{
+					CommonNodeNetworkControllerInfo: CommonNodeNetworkControllerInfo{
+						watchFactory: wf,
+					},
+				},
+				conntrackEndpointSliceQueue: q,
+				pendingConntrackRemovals:    make(map[string]map[pendingConntrackEndpoint]struct{}),
+			}
+
+			// Update: 10.0.0.1 was already unready in epsUnready1, and is still unready in epsUnready2.
+			// 10.0.0.2 was added as ready. No endpoints were removed!
+			nc.onConntrackEndpointSliceUpdate(epsUnready1, epsUnready2)
+			Expect(q.Len()).To(Equal(0))
+		})
+
+		It("reconcileEndpointSliceConntrack flushes conntrack when service label is removed under segmentation", func() {
 			Expect(config.PrepareTestConfig()).To(Succeed())
 			config.OVNKubernetesFeature.EnableMultiNetwork = true
 			config.OVNKubernetesFeature.EnableNetworkSegmentation = true
@@ -2556,25 +2705,30 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			defer wf.Shutdown()
 			Expect(wf.Start()).To(Succeed())
 
+			key := "test-ns/test-endpointslice"
 			nc := &DefaultNodeNetworkController{
 				BaseNodeNetworkController: BaseNodeNetworkController{
 					CommonNodeNetworkControllerInfo: CommonNodeNetworkControllerInfo{
 						watchFactory: wf,
 					},
 				},
+				pendingConntrackRemovals: map[string]map[pendingConntrackEndpoint]struct{}{
+					key: {
+						{
+							serviceNamespacedName: k8stypes.NamespacedName{Namespace: "test-ns", Name: "test-service"},
+							endpointIP:            "10.0.0.1",
+							portName:              "http",
+							port:                  testEndpointPort1,
+							protocol:              udpProtocol,
+						}: {},
+					},
+				},
 			}
-
-			key := "test-ns/test-endpointslice"
-			cachedEPS := makeEndpointSlice([]endpointPortConfig{
-				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
-			}, []string{"10.0.0.1"})
-			nc.conntrackEndpointSliceCache.Store(key, cachedEPS)
 
 			Expect(nc.reconcileEndpointSliceConntrack(key)).To(Succeed())
 			mockNetLinkOps.AssertExpectations(GinkgoT())
 
-			_, inCache := nc.conntrackEndpointSliceCache.Load(key)
-			Expect(inCache).To(BeFalse())
+			Expect(nc.pendingConntrackRemovals[key]).To(BeEmpty())
 		})
 
 		It("processConntrackEndpointSliceItem drops item from queue when max attempts are exceeded", func() {
@@ -2588,6 +2742,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 			wfMock.On("GetEndpointSlice", "test-ns", "test-eps").Return(nil, apierrors.NewNotFound(discovery.Resource("endpointslices"), "test-eps"))
 			wfMock.On("GetService", "test-ns", "test-service").Return(nil, fmt.Errorf("service error"))
 
+			key := "test-ns/test-eps"
 			nc := &DefaultNodeNetworkController{
 				BaseNodeNetworkController: BaseNodeNetworkController{
 					CommonNodeNetworkControllerInfo: CommonNodeNetworkControllerInfo{
@@ -2595,13 +2750,18 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 					},
 				},
 				conntrackEndpointSliceQueue: q,
+				pendingConntrackRemovals: map[string]map[pendingConntrackEndpoint]struct{}{
+					key: {
+						{
+							serviceNamespacedName: k8stypes.NamespacedName{Namespace: "test-ns", Name: "test-service"},
+							endpointIP:            "10.0.0.1",
+							portName:              "http",
+							port:                  testEndpointPort1,
+							protocol:              udpProtocol,
+						}: {},
+					},
+				},
 			}
-
-			key := "test-ns/test-eps"
-			cachedEPS := makeEndpointSlice([]endpointPortConfig{
-				{name: strPtr("http"), port: testEndpointPort1, protocol: udpProtocol},
-			}, []string{"10.0.0.1"})
-			nc.conntrackEndpointSliceCache.Store(key, cachedEPS)
 
 			for i := 0; i < controller.DefaultMaxAttempts; i++ {
 				q.AddRateLimited(key)
@@ -2612,9 +2772,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 
 			Expect(nc.processConntrackEndpointSliceItem()).To(BeTrue())
 			Expect(q.NumRequeues(key)).To(Equal(0))
-			// Verify stale cache entry is cleaned up on drop when slice is not found
-			_, inCache := nc.conntrackEndpointSliceCache.Load(key)
-			Expect(inCache).To(BeFalse())
+			Expect(nc.pendingConntrackRemovals[key]).To(BeEmpty())
 		})
 
 		It("processNodeItem drops item from queue when max attempts are exceeded", func() {
@@ -2626,6 +2784,7 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 
 			wfMock := &factoryMocks.NodeWatchFactory{}
 			wfMock.On("GetNode", "bad-node").Return(nil, apierrors.NewNotFound(corev1.Resource("nodes"), "bad-node"))
+			wfMock.On("GetNodes").Return([]*corev1.Node{}, fmt.Errorf("list nodes error"))
 
 			nc := &DefaultNodeNetworkController{
 				BaseNodeNetworkController: BaseNodeNetworkController{
@@ -2636,8 +2795,6 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 				nodeQueue: q,
 			}
 
-			nc.remoteNodeIPs.Store("bad-node", []net.IP{net.ParseIP("10.0.0.1")})
-
 			for i := 0; i < controller.DefaultMaxAttempts; i++ {
 				q.AddRateLimited("bad-node")
 			}
@@ -2647,9 +2804,52 @@ add element inet ovn-kubernetes remote-node-ips-v6 { 2002:db8:1::4 }
 
 			Expect(nc.processNodeItem()).To(BeTrue())
 			Expect(q.NumRequeues("bad-node")).To(Equal(0))
-			// Verify remoteNodeIPs is cleaned up on drop when node is not found
-			_, inCache := nc.remoteNodeIPs.Load("bad-node")
-			Expect(inCache).To(BeFalse())
+		})
+
+		It("syncRemoteNodeNFTRules syncs remote node IPs into nftables sets", func() {
+			Expect(config.PrepareTestConfig()).To(Succeed())
+			config.IPv4Mode = true
+			config.IPv6Mode = false
+			config.OvnKubeNode.Mode = types.NodeModeFull
+
+			_ = nodenft.SetFakeNFTablesHelper()
+
+			node1 := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-node"},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.1"},
+					},
+				},
+			}
+			remoteNode := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "remote-node"},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.2"},
+					},
+				},
+			}
+
+			fakeClient := fake.NewSimpleClientset(node1, remoteNode)
+			wf, err := factory.NewNodeWatchFactory(&util.OVNNodeClientset{
+				KubeClient:            fakeClient,
+				NetworkAttchDefClient: nadfake.NewSimpleClientset(),
+			}, "my-node")
+			Expect(err).NotTo(HaveOccurred())
+			defer wf.Shutdown()
+			Expect(wf.Start()).To(Succeed())
+
+			nc := &DefaultNodeNetworkController{
+				BaseNodeNetworkController: BaseNodeNetworkController{
+					CommonNodeNetworkControllerInfo: CommonNodeNetworkControllerInfo{
+						name:         "my-node",
+						watchFactory: wf,
+					},
+				},
+			}
+
+			Expect(nc.syncRemoteNodeNFTRules()).To(Succeed())
 		})
 	})
 
